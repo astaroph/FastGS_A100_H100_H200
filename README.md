@@ -316,6 +316,8 @@ That is expected in this workflow. The successful recipes used different PyTorch
 
 * A100 recipe: `TORCH_CUDA_ARCH_LIST="8.0 8.6+PTX"`
 * H100/H200 recipe: `TORCH_CUDA_ARCH_LIST="9.0"`
+<div align="center">
+
 
 
 
