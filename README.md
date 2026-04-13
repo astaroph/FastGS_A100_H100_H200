@@ -6,6 +6,319 @@
 
 </div>
 
+
+## Fork of Original FastGS repo with custom Ampere and Hopper Class GPU build instructions, intended for Slurm cluster environment
+### Credit and upstream provenance
+FastGS is an external project and should be credited to its original authors and repository. Original links to this repo have been retained above
+
+## Build notes
+In this build workflow, a user may choose to use either the original FastGS repository or a fork that contains local compatibility fixes and pipeline-specific adjustments.
+
+The build recipes below were adapted from successful installs used in this pipeline environment, but they are not guaranteed to work unchanged on every cluster. In particular, users must verify their own module names, compiler toolchains, CUDA installation paths, and available PyTorch wheel compatibility before building.
+
+The successful build recipes below used:
+
+* Python: `3.10.13`
+* GCC: `10.2.0`
+* CUDA module: `11.8.0`
+
+These exact names may differ on your cluster even when the underlying versions are the same.
+
+### Important cluster note
+
+Before running either build route below, verify all of the following on your own system:
+
+* the correct module names for `gcc` and `cuda`
+* the correct path to your conda or mamba installation
+* the correct CUDA root path for `CUDA_HOME`
+* whether your cluster permits internet access during environment creation
+* whether your GPU nodes support the PyTorch and CUDA wheel combination you are installing
+
+The commands below use placeholder paths such as:
+
+* `PATH/TO/USER/SOFTWARE`
+* `PATH/TO/USER/CONDA_ENVS`
+* `PATH/TO/USER/CONDA_PKGS`
+* `PATH/TO/CUDA`
+
+Replace all of them with real locations before running.
+
+---
+
+## A100 build route
+
+This route was used successfully for A100-class GPUs.
+
+### 1. Start from a clean shell and load modules
+
+```bash
+module purge
+module load gcc/10.2.0
+module load cuda/11.8.0
+
+conda deactivate 2>/dev/null || true
+```
+
+### 2. Set user-specific locations
+
+```bash
+export REPO_PARENT="PATH/TO/USER/SOFTWARE"
+export REPO_DIR="${REPO_PARENT}/FastGS"
+export ENV_DIR="PATH/TO/USER/CONDA_ENVS/FastGS"
+export CONDA_PKGS_DIRS="PATH/TO/USER/CONDA_PKGS"
+
+mkdir -p "${REPO_PARENT}"
+mkdir -p "${CONDA_PKGS_DIRS}"
+```
+
+### 3. Clone FastGS
+
+```bash
+cd "${REPO_PARENT}"
+git clone --recursive <YOUR_FASTGS_FORK_URL>
+cd "${REPO_DIR}"
+```
+
+### 4. Create a minimal conda environment
+
+```bash
+mamba create -y \
+  -p "${ENV_DIR}" \
+  python=3.10.13 \
+  pip=22.3.1 \
+  plyfile \
+  tqdm \
+  websockets \
+  "numpy<2" \
+  "setuptools<81" \
+  -c conda-forge -c pytorch
+```
+
+### 5. Activate the environment
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "${ENV_DIR}"
+```
+
+### 6. Install CUDA-enabled PyTorch
+
+This successful recipe used PyTorch `1.12.1+cu116`, even though the cluster CUDA module loaded was `11.8.0`. That worked in the original tested environment, but users should verify compatibility for their own systems.
+
+```bash
+python -m pip install \
+  torch==1.12.1+cu116 \
+  torchvision==0.13.1+cu116 \
+  torchaudio==0.12.1 \
+  --extra-index-url https://download.pytorch.org/whl/cu116
+```
+
+### 7. Set build environment variables
+
+```bash
+export CUDA_HOME="PATH/TO/CUDA"
+export CC="$(which gcc)"
+export CXX="$(which g++)"
+export TORCH_CUDA_ARCH_LIST="8.0 8.6+PTX"
+export MAX_JOBS=4
+```
+
+### 8. Install FastGS submodules
+
+```bash
+pip install ./submodules/diff-gaussian-rasterization_fastgs
+pip install ./submodules/simple-knn
+pip install ./submodules/fused-ssim
+```
+
+### 9. Sanity check
+
+```bash
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("torch cuda:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("device:", torch.cuda.get_device_name(0))
+    print("arch list:", torch.cuda.get_arch_list())
+PY
+```
+
+---
+
+## H100 / H200 build route
+
+This route was used successfully for Hopper-class systems, including H100 and H200.
+
+### 1. Start from a clean shell and load modules
+
+```bash
+module purge
+module load gcc/10.2.0
+module load cuda/11.8.0
+
+conda deactivate 2>/dev/null || true
+```
+
+### 2. Set user-specific locations
+
+```bash
+export REPO_PARENT="PATH/TO/USER/SOFTWARE"
+export REPO_DIR="${REPO_PARENT}/FastGS"
+export ENV_DIR="PATH/TO/USER/CONDA_ENVS/FastGS_h100"
+export CONDA_PKGS_DIRS="PATH/TO/USER/CONDA_PKGS"
+
+mkdir -p "${REPO_PARENT}"
+mkdir -p "${CONDA_PKGS_DIRS}"
+```
+
+### 3. Clone FastGS if needed
+
+```bash
+if [[ ! -d "${REPO_DIR}" ]]; then
+  cd "${REPO_PARENT}"
+  git clone --recursive <YOUR_FASTGS_FORK_URL>
+fi
+
+cd "${REPO_DIR}"
+```
+
+### 4. Create the conda environment
+
+```bash
+mamba create -y -p "${ENV_DIR}" \
+  python=3.10.13 \
+  pip \
+  "setuptools<81" \
+  wheel \
+  ninja \
+  cmake \
+  packaging \
+  "numpy<2" \
+  pillow \
+  plyfile \
+  tqdm \
+  websockets
+```
+
+### 5. Activate the environment
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "${ENV_DIR}"
+```
+
+### 6. Install CUDA-enabled PyTorch
+
+This successful recipe used PyTorch `2.4.1+cu118`.
+
+```bash
+python -m pip install \
+  torch==2.4.1+cu118 \
+  torchvision==0.19.1+cu118 \
+  torchaudio==2.4.1+cu118 \
+  --index-url https://download.pytorch.org/whl/cu118
+```
+
+### 7. Set build environment variables
+
+```bash
+export CUDA_HOME="PATH/TO/CUDA"
+export PATH="${CUDA_HOME}/bin:${PATH}"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}"
+export CC="$(which gcc)"
+export CXX="$(which g++)"
+export MAX_JOBS=4
+export TORCH_CUDA_ARCH_LIST="9.0"
+```
+
+### 8. Verify PyTorch sees the GPU
+
+```bash
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("torch cuda runtime:", torch.version.cuda)
+print("cuda available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("device:", torch.cuda.get_device_name(0))
+    print("arch list:", torch.cuda.get_arch_list())
+PY
+```
+
+### 9. Install FastGS submodules
+
+For this successful build, the submodules were installed with `--no-build-isolation`.
+
+```bash
+python -m pip install --no-build-isolation ./submodules/diff-gaussian-rasterization_fastgs
+python -m pip install --no-build-isolation ./submodules/simple-knn
+python -m pip install --no-build-isolation ./submodules/fused-ssim
+```
+
+### 10. Import test
+
+```bash
+python - <<'PY'
+import torch
+import diff_gaussian_rasterization_fastgs
+import simple_knn
+import fused_ssim
+print("All core imports succeeded.")
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+PY
+```
+
+---
+
+## Required FastGS source modification for this pipeline
+
+For this pipeline’s COLMAP dataset layout, FastGS must preserve subdirectory information when resolving image paths. If your FastGS checkout still uses `os.path.basename(extr.name)` inside `scene/dataset_readers.py`, update it as follows.
+
+### Change
+
+```python
+# from
+image_path = os.path.join(images_folder, os.path.basename(extr.name))
+
+# to
+image_path = os.path.join(images_folder, extr.name)
+```
+
+### Why this is required
+
+This pipeline may stage COLMAP-compatible image datasets with camera subdirectories inside the image root. In that case, stripping the basename causes FastGS to lose the relative camera-subdirectory structure and fail to resolve images correctly.
+
+---
+
+
+## Troubleshooting
+
+### Build succeeds but import fails
+
+Check that:
+
+* `CUDA_HOME` points to the correct toolkit root
+* `gcc` and `g++` resolve to the intended compiler
+* the environment was activated before installing submodules
+* your PyTorch CUDA wheel matches the intended GPU architecture closely enough for your cluster
+
+### Dataset loads fail even though training starts
+
+Check `scene/dataset_readers.py` and confirm the `extr.name` change above is present.
+
+### A100 and Hopper builds behave differently
+
+That is expected in this workflow. The successful recipes used different PyTorch versions and different architecture settings:
+
+* A100 recipe: `TORCH_CUDA_ARCH_LIST="8.0 8.6+PTX"`
+* H100/H200 recipe: `TORCH_CUDA_ARCH_LIST="9.0"`
+
+
+
 <p align="center">
     <img src="assets/teaser_fastgs.png" width="800px"/>
 </p>
