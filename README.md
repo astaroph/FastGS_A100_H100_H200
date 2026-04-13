@@ -75,7 +75,7 @@ mkdir -p "${CONDA_PKGS_DIRS}"
 
 ```bash
 cd "${REPO_PARENT}"
-git clone --recursive <YOUR_FASTGS_FORK_URL>
+git clone --recursive https://github.com/astaroph/FastGS_A100_H100_H200.git
 cd "${REPO_DIR}"
 ```
 
@@ -178,7 +178,7 @@ mkdir -p "${CONDA_PKGS_DIRS}"
 ```bash
 if [[ ! -d "${REPO_DIR}" ]]; then
   cd "${REPO_PARENT}"
-  git clone --recursive <YOUR_FASTGS_FORK_URL>
+  git clone --recursive https://github.com/astaroph/FastGS_A100_H100_H200.git
 fi
 
 cd "${REPO_DIR}"
