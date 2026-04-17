@@ -150,12 +150,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # The multiview consistent pruning of fastgs. We do it every 3k iterations after 15k
             # In this stage, the model converge basically. So we can prune more aggressively without degrading rendering quality.
             # You can check the rendering results of 20K iterations in arxiv version (https://arxiv.org/abs/2511.04283), the rendering quality is already very good.
-            if iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
+            if iteration % 3000 == 0 and iteration > opt.densify_until_iter and iteration < 30_000:
                 my_viewpoint_stack = scene.getTrainCameras().copy()
                 camlist = sampling_cameras(my_viewpoint_stack)
 
-                _, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt)                    
-                gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
+                _, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt)
+
+                before = gaussians.get_xyz.shape[0]
+
+                # Gentler late prune for label-mode stability
+                gaussians.final_prune_fastgs(
+                    min_opacity=0.05,
+                    pruning_score=pruning_score,
+                    score_thresh=0.95,
+                    min_keep=1024,
+                )
+
+                after = gaussians.get_xyz.shape[0]
+                print(f"[ITER {iteration}] final prune: {before} -> {after}")
         
             # Optimization step
             if iteration < opt.iterations:
