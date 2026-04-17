@@ -530,11 +530,36 @@ class GaussianModel:
         self.xyz_gradient_accum_abs[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, 2:], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    def final_prune_fastgs(self, min_opacity, pruning_score = None):
-        """Final-stage pruning: remove Gaussians based on opacity and multi-view consistency.
-        In the final stage we remove Gaussians that have low opacity or that are flagged by
-        our multi-view reconstruction consistency metric (provided as `pruning_score`)."""
-        prune_mask = (self.get_opacity < min_opacity).squeeze() 
-        scores_mask = pruning_score > 0.9
+    def final_prune_fastgs(self, min_opacity, pruning_score=None, score_thresh=0.9, min_keep=1024):
+        """
+        Final-stage pruning with collapse protection.
+        Never allows the full model to be pruned away.
+        """
+        n = self.get_xyz.shape[0]
+        if n == 0:
+            return
+
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+
+        if pruning_score is None or pruning_score.numel() != n:
+            scores_mask = torch.zeros_like(prune_mask, dtype=torch.bool, device=prune_mask.device)
+        else:
+            scores_mask = pruning_score > score_thresh
+
         final_prune = torch.logical_or(prune_mask, scores_mask)
+
+        # Protect against complete collapse
+        num_pruned = int(final_prune.sum().item())
+        if num_pruned >= n:
+            keep = min(max(min_keep, 1), n)
+
+            if pruning_score is not None and pruning_score.numel() == n:
+                # Keep the lowest-score Gaussians
+                keep_idx = torch.topk(pruning_score, k=keep, largest=False).indices
+                safe_mask = torch.ones(n, dtype=torch.bool, device=prune_mask.device)
+                safe_mask[keep_idx] = False
+                final_prune = safe_mask
+            else:
+                final_prune = torch.zeros_like(prune_mask, dtype=torch.bool, device=prune_mask.device)
+
         self.prune_points(final_prune)
