@@ -54,6 +54,15 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+
+        # ROI (FastGS + LightSeg) parameters — all default-off / byte-identical when
+        # use_roi_masks is False. See docs/FASTGS_ROI_lightseg_implementation_plan_2026-08-06.md.
+        self.use_roi_masks = False
+        self.roi_masks_dir = ""
+        self.roi_class_weights = "0:0.15,1:1.0,2:1.0,3:1.0,4:1.0"
+        self.roi_dilate_px = 12
+        self.roi_missing = "fail_open"  # or "fail_loud"
+        self.roi_max_failopen_frac = 0.10
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -98,6 +107,25 @@ class OptimizationParams(ParamGroup):
         self.grad_thresh = 0.0002
         self.dense = 0.001
         self.mult = 0.5      # multiplier for the compact box to control the tile number of each splat
+
+        # ROI (FastGS + LightSeg) parameters — consumed by train.py's ROI training-loop
+        # integration (loss weighting, densify gating, background prune, schedules).
+        # NOTE: OptimizationParams are NOT persisted in cfg_args (only ModelParams are).
+        # See docs/FASTGS_ROI_lightseg_implementation_plan_2026-08-06.md §4.1.
+        self.roi_warmup_iters = 1000
+        self.roi_ramp_iters = 300
+        self.roi_norm = "global"  # or "roi"
+        # -1 means roi_warmup_iters + roi_ramp_iters (resolved at consumption time, not here).
+        self.roi_densify_start_iter = -1
+        self.roi_densify_mode = "intersect"  # or "blend"
+        self.roi_densify_bg_scale = 0.10
+        self.roi_prune_background = False
+        self.roi_prune_start_iter = 3000
+        self.roi_prune_min_rounds = 2
+        self.roi_prune_min_keep = 1024
+        self.score_num_cameras = 10
+        self.final_prune_interval = 3000
+        self.final_prune_until_iter = 30000
 
         self.random_background = False
         self.optimizer_type = "default"

@@ -68,6 +68,14 @@ class GaussianModel:
         self.shoptimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.tmp_radii = None
+        # Per-gaussian count of consecutive score events with zero ROI-pixel
+        # touches (object-only background pruning). None unless ROI background
+        # pruning is active. Must be remapped through every tensor resize
+        # (prune_points / densification_postfix) like the accumulators —
+        # resetting it on resize would make it structurally inert because the
+        # population changes at essentially every densify/prune event.
+        self.roi_zero_rounds = None
         self.setup_functions()
 
     def capture(self, optimizer_type):
@@ -379,6 +387,8 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         if self.tmp_radii is not None:
             self.tmp_radii = self.tmp_radii[valid_points_mask]
+        if getattr(self, "roi_zero_rounds", None) is not None:
+            self.roi_zero_rounds = self.roi_zero_rounds[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -427,6 +437,15 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")  # abs
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        if getattr(self, "roi_zero_rounds", None) is not None:
+            # New gaussians start innocent (0 consecutive zero-touch rounds).
+            num_new = self.get_xyz.shape[0] - self.roi_zero_rounds.shape[0]
+            if num_new > 0:
+                self.roi_zero_rounds = torch.cat((
+                    self.roi_zero_rounds,
+                    torch.zeros(num_new, dtype=self.roi_zero_rounds.dtype,
+                                device=self.roi_zero_rounds.device),
+                ))
 
     def densify_and_split_fastgs(self, metric_mask, filter, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -529,6 +548,61 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.xyz_gradient_accum_abs[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, 2:], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def update_roi_zero_rounds(self, roi_touch):
+        """
+        Object-only ROI mode: advance the consecutive zero-ROI-touch counters.
+        roi_touch is the (N,) per-gaussian count of ROI pixels touched across the
+        sampled score views (from compute_gaussian_score_fastgs). Must be called
+        with counts aligned to the CURRENT population, i.e. before any
+        densify/prune resize in the same event.
+        """
+        n = self.get_xyz.shape[0]
+        if roi_touch is None or roi_touch.shape[0] != n:
+            return
+        if self.roi_zero_rounds is None or self.roi_zero_rounds.shape[0] != n:
+            self.roi_zero_rounds = torch.zeros(n, dtype=torch.int32, device=self.get_xyz.device)
+        zero_touch = roi_touch.to(self.roi_zero_rounds.device) == 0
+        self.roi_zero_rounds = torch.where(
+            zero_touch,
+            self.roi_zero_rounds + 1,
+            torch.zeros_like(self.roi_zero_rounds),
+        )
+
+    def prune_background_by_rounds(self, min_rounds, min_keep=1024):
+        """
+        Object-only ROI mode: prune gaussians whose counter reached min_rounds
+        consecutive zero-ROI-touch score events. Counters are remapped through
+        resizes (prune_points / densification_postfix), so calling this after
+        the same event's densify/prune is index-safe and newly created gaussians
+        are never eligible. Collapse guard mirrors final_prune_fastgs: if fewer
+        than min_keep gaussians would survive, the candidates with the LOWEST
+        counters (most recently seen in the ROI) are spared. Returns the number
+        pruned.
+        """
+        n = self.get_xyz.shape[0]
+        if n == 0 or self.roi_zero_rounds is None or self.roi_zero_rounds.shape[0] != n:
+            return 0
+        bg_mask = self.roi_zero_rounds >= min_rounds
+        num = int(bg_mask.sum().item())
+        if num == 0:
+            return 0
+        survivors = n - num
+        floor = min(max(int(min_keep), 1), n)
+        if survivors < floor:
+            deficit = floor - survivors
+            cand_idx = torch.nonzero(bg_mask, as_tuple=False).squeeze(1)
+            spare = torch.topk(
+                self.roi_zero_rounds[cand_idx],
+                k=min(deficit, cand_idx.shape[0]),
+                largest=False,
+            ).indices
+            bg_mask[cand_idx[spare]] = False
+            num = int(bg_mask.sum().item())
+            if num == 0:
+                return 0
+        self.prune_points(bg_mask)
+        return num
 
     def final_prune_fastgs(self, min_opacity, pruning_score=None, score_thresh=0.9, min_keep=1024):
         """

@@ -22,7 +22,7 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], roi_for_training=False):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -40,9 +40,21 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
+        # ROI (FastGS + LightSeg): only threaded through when the caller opts in
+        # (train.py) AND the flag is set; render.py leaves roi_for_training at its
+        # default False, so mask loading is skipped there unconditionally. See
+        # docs/FASTGS_ROI_lightseg_implementation_plan_2026-08-06.md §4.3 item 1.
+        roi_enabled = roi_for_training and getattr(args, "use_roi_masks", False)
+
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
+            colmap_kwargs = {}
+            if roi_enabled:
+                masks_dir = args.roi_masks_dir or os.path.join(args.source_path, "masks")
+                colmap_kwargs["masks_dir"] = masks_dir
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, **colmap_kwargs)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+            if roi_enabled:
+                raise ValueError("ROI masks are not supported for Blender scenes")
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
         else:

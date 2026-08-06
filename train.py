@@ -11,10 +11,12 @@
 
 import torch
 import numpy as np
-import os, random, time
+import os, random, time, json
 from random import randint
+from types import SimpleNamespace
 from lpipsPyTorch import lpips
 from utils.loss_utils import l1_loss
+from utils.roi_utils import parse_class_weights, masked_l1, masked_ssim
 from fused_ssim import fused_ssim as fast_ssim
 from gaussian_renderer import render_fastgs, network_gui_ws
 import sys
@@ -38,11 +40,93 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians)
+    roi_enabled = bool(getattr(dataset, "use_roi_masks", False))
+
+    # --- ROI config validation (BEFORE Scene: loadCam consumes roi_missing during
+    # scene construction, and a typo'd enum must fail before any GPU-heavy work) --
+    roi_densify_start = 0
+    roi_prune_bg = False
+    roi_failopen_count = 0
+    roi_mean_fg_frac = None
+    if roi_enabled:
+        if opt.roi_norm not in ("roi", "global"):
+            raise RuntimeError(
+                "[ROI] unknown --roi_norm {!r}: expected 'roi' or 'global'".format(opt.roi_norm))
+        if opt.roi_densify_mode not in ("intersect", "blend"):
+            raise RuntimeError(
+                "[ROI] unknown --roi_densify_mode {!r}: expected 'intersect' or 'blend'".format(
+                    opt.roi_densify_mode))
+        if dataset.roi_missing not in ("fail_open", "fail_loud"):
+            raise RuntimeError(
+                "[ROI] unknown --roi_missing {!r}: expected 'fail_open' or 'fail_loud'".format(
+                    dataset.roi_missing))
+        if getattr(opt, "final_prune_interval", 3000) < 1:
+            raise RuntimeError("[ROI] --final_prune_interval must be >= 1")
+        warmup = int(getattr(opt, "roi_warmup_iters", 1000))
+        ramp = int(getattr(opt, "roi_ramp_iters", 300))
+        start = int(getattr(opt, "roi_densify_start_iter", -1))
+        roi_densify_start = start if start >= 0 else warmup + ramp
+        roi_prune_bg = bool(getattr(opt, "roi_prune_background", False))
+        if roi_prune_bg:
+            lut = parse_class_weights(dataset.roi_class_weights)
+            if float(lut[0]) != 0.0:
+                raise RuntimeError(
+                    "[ROI] --roi_prune_background requires background weight exactly 0.0 "
+                    "(pass 0:0.0 in --roi_class_weights); pruning what a nonzero "
+                    "background weight is simultaneously supervising is incoherent."
+                )
+            # Pruning must never engage while the loss is still unmasked / the
+            # densify gate still admits background (prune->regrow churn); clamp.
+            if opt.roi_prune_start_iter < roi_densify_start:
+                print("[ROI] clamping roi_prune_start_iter {} -> {} (must not precede "
+                      "the densify gate / end of warmup+ramp)".format(
+                          opt.roi_prune_start_iter, roi_densify_start))
+                opt.roi_prune_start_iter = roi_densify_start
+    # ---------------------------------------------------------------------------
+
+    scene = Scene(dataset, gaussians, roi_for_training=roi_enabled)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    # --- ROI mask coverage check / banner (after Scene: needs loaded cameras) ---
+    if roi_enabled:
+        train_cams = scene.getTrainCameras()
+        roi_failopen_count = sum(
+            1 for cam in train_cams if getattr(cam, "roi_weight", None) is None
+        )
+        max_frac = float(getattr(dataset, "roi_max_failopen_frac", 0.10))
+        if len(train_cams) > 0 and roi_failopen_count / len(train_cams) > max_frac:
+            raise RuntimeError(
+                "[ROI] {}/{} training views have no usable mask (fail-open), exceeding "
+                "--roi_max_failopen_frac={}. Mass mask failure means the export step is "
+                "broken; refusing to train near-unmasked under an ROI method hash.".format(
+                    roi_failopen_count, len(train_cams), max_frac
+                )
+            )
+        with torch.no_grad():
+            fg = [
+                float((cam.roi_bin > 0).float().mean().item())
+                for cam in train_cams
+                if getattr(cam, "roi_bin", None) is not None
+            ]
+        if fg:
+            roi_mean_fg_frac = sum(fg) / len(fg)
+            print(
+                "[ROI] enabled | norm={} | mean fg frac={:.4f} (implied roi-norm grad "
+                "scale ~{:.2f}x) | fail-open views={}/{} | densify gate from iter {} | "
+                "background prune={}".format(
+                    opt.roi_norm,
+                    roi_mean_fg_frac,
+                    1.0 / max(roi_mean_fg_frac, 1e-6),
+                    roi_failopen_count,
+                    len(train_cams),
+                    roi_densify_start,
+                    roi_prune_bg,
+                )
+            )
+    # ---------------------------------------------------------------------------
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -62,6 +146,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     bg = torch.rand((3), device="cuda") if opt.random_background else background
+
+    # train_stats.json collection
+    stats_iter_samples = []
+    stats_densify_events = []
+    stats_bg_pruned_total = 0
+    roi_starvation_warned = False
 
     for iteration in range(first_iter, opt.iterations + 1):
 
@@ -98,8 +188,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        roi_W = None
+        if roi_enabled and iteration > opt.roi_warmup_iters:
+            roi_W = getattr(viewpoint_cam, "roi_weight", None)
+        if roi_W is not None:
+            roi_W = roi_W.cuda().float()
+            if opt.roi_ramp_iters > 0:
+                ramp_t = min(1.0, (iteration - opt.roi_warmup_iters) / float(opt.roi_ramp_iters))
+            else:
+                ramp_t = 1.0
+            if ramp_t < 1.0:
+                # Linear fade-in: a hard normalization switch shocks Adam's second
+                # moments right as densify events compare raw gradients to fixed
+                # thresholds; ramping removes the transient.
+                roi_W = (1.0 - ramp_t) + ramp_t * roi_W
+            Ll1 = masked_l1(image, gt_image, roi_W, opt.roi_norm)
+            ssim_value = masked_ssim(image.unsqueeze(0), gt_image.unsqueeze(0), roi_W, opt.roi_norm)
+        else:
+            Ll1 = l1_loss(image, gt_image)
+            ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
         loss.backward()
 
@@ -132,17 +239,56 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     my_viewpoint_stack = scene.getTrainCameras().copy()
-                    camlist = sampling_cameras(my_viewpoint_stack)
+                    camlist = sampling_cameras(my_viewpoint_stack, getattr(opt, "score_num_cameras", 10))
+
+                    roi_cfg = None
+                    if roi_enabled:
+                        roi_cfg = SimpleNamespace(
+                            densify_active=(iteration >= roi_densify_start),
+                            densify_mode=opt.roi_densify_mode,
+                            bg_scale=opt.roi_densify_bg_scale,
+                            track_roi_touch=roi_prune_bg,
+                            last_flagged_px_mean=None,
+                        )
 
                     # The multiview consistent densification of fastgs
-                    importance_score, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt, DENSIFY=True)                    
-                    gaussians.densify_and_prune_fastgs(max_screen_size = size_threshold, 
-                                                min_opacity = 0.005, 
-                                                extent = scene.cameras_extent, 
+                    importance_score, pruning_score, roi_touch = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt, DENSIFY=True, roi_cfg=roi_cfg)
+                    if roi_cfg is not None and roi_cfg.track_roi_touch:
+                        # Counter update must precede the resize below (counts are
+                        # aligned to the current population; the counter itself is
+                        # remapped through prune/cat inside the model).
+                        gaussians.update_roi_zero_rounds(roi_touch)
+
+                    n_before_densify = gaussians.get_xyz.shape[0]
+                    gaussians.densify_and_prune_fastgs(max_screen_size = size_threshold,
+                                                min_opacity = 0.005,
+                                                extent = scene.cameras_extent,
                                                 radii=radii,
                                                 args = opt,
                                                 importance_score = importance_score,
                                                 pruning_score = pruning_score)
+
+                    if roi_enabled and roi_prune_bg and iteration >= opt.roi_prune_start_iter:
+                        pruned_bg = gaussians.prune_background_by_rounds(
+                            opt.roi_prune_min_rounds, opt.roi_prune_min_keep)
+                        if pruned_bg:
+                            stats_bg_pruned_total += pruned_bg
+                            print(f"[ITER {iteration}] ROI background prune: removed {pruned_bg}")
+
+                    flagged_mean = roi_cfg.last_flagged_px_mean if roi_cfg is not None else None
+                    stats_densify_events.append({
+                        "iter": iteration,
+                        "n_before": int(n_before_densify),
+                        "n_after": int(gaussians.get_xyz.shape[0]),
+                        "roi_flagged_px_mean": flagged_mean,
+                    })
+                    if (roi_cfg is not None and roi_cfg.densify_active
+                            and flagged_mean is not None and flagged_mean < 10.0
+                            and not roi_starvation_warned):
+                        print(f"[ITER {iteration}] WARNING: ROI densify map has ~no flagged "
+                              f"pixels (mean {flagged_mean:.1f}/view) - ROI densification is "
+                              f"starving; check loss_thresh / mask quality.")
+                        roi_starvation_warned = True
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -150,11 +296,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # The multiview consistent pruning of fastgs. We do it every 3k iterations after 15k
             # In this stage, the model converge basically. So we can prune more aggressively without degrading rendering quality.
             # You can check the rendering results of 20K iterations in arxiv version (https://arxiv.org/abs/2511.04283), the rendering quality is already very good.
-            if iteration % 3000 == 0 and iteration > opt.densify_until_iter and iteration < 30_000:
+            if (getattr(opt, "final_prune_interval", 3000) > 0
+                    and iteration % opt.final_prune_interval == 0
+                    and iteration > opt.densify_until_iter
+                    and iteration < getattr(opt, "final_prune_until_iter", 30_000)):
                 my_viewpoint_stack = scene.getTrainCameras().copy()
-                camlist = sampling_cameras(my_viewpoint_stack)
+                camlist = sampling_cameras(my_viewpoint_stack, getattr(opt, "score_num_cameras", 10))
 
-                _, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt)
+                roi_cfg = None
+                if roi_enabled and roi_prune_bg:
+                    roi_cfg = SimpleNamespace(
+                        densify_active=False,
+                        densify_mode=opt.roi_densify_mode,
+                        bg_scale=opt.roi_densify_bg_scale,
+                        track_roi_touch=True,
+                        last_flagged_px_mean=None,
+                    )
+
+                _, pruning_score, roi_touch = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt, roi_cfg=roi_cfg)
+                if roi_cfg is not None:
+                    gaussians.update_roi_zero_rounds(roi_touch)
 
                 before = gaussians.get_xyz.shape[0]
 
@@ -168,6 +329,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 after = gaussians.get_xyz.shape[0]
                 print(f"[ITER {iteration}] final prune: {before} -> {after}")
+
+                if roi_enabled and roi_prune_bg and iteration >= opt.roi_prune_start_iter:
+                    pruned_bg = gaussians.prune_background_by_rounds(
+                        opt.roi_prune_min_rounds, opt.roi_prune_min_keep)
+                    if pruned_bg:
+                        stats_bg_pruned_total += pruned_bg
+                        print(f"[ITER {iteration}] ROI background prune: removed {pruned_bg}")
         
             # Optimization step
             if iteration < opt.iterations:
@@ -184,9 +352,51 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             optim_time = optim_start.elapsed_time(optim_end)
             total_time += (iter_time + optim_time) / 1e3
 
-    # scene.save(iteration)
+            if iteration % 500 == 0:
+                stats_iter_samples.append({
+                    "iter": iteration,
+                    "ema_loss": ema_loss_for_log,
+                    "iter_time_ms": iter_time,
+                    "gaussian_count": int(gaussians.get_xyz.shape[0]),
+                })
+
+    if opt.iterations in saving_iterations:
+        # Re-save the terminal PLY: the in-loop save runs BEFORE the same
+        # iteration's densify/late-prune blocks, so a run ending on a prune
+        # event would otherwise persist a pre-prune point cloud. Overwriting
+        # here is a no-op when no terminal event fired.
+        print("\n[ITER {}] Saving Gaussians (post-prune terminal save)".format(opt.iterations))
+        scene.save(opt.iterations)
+
     print(f"Gaussian number: {gaussians._xyz.shape[0]}")
     print(f"Training time: {total_time}")
+
+    stats = {
+        "wall_clock_s": total_time,
+        "iterations": opt.iterations,
+        "final_gaussian_count": int(gaussians._xyz.shape[0]),
+        "peak_vram_bytes": int(torch.cuda.max_memory_allocated()),
+        "iter_samples_by_500": stats_iter_samples,
+        "densify_events": stats_densify_events,
+        "roi": {
+            "enabled": roi_enabled,
+            "norm": getattr(opt, "roi_norm", None) if roi_enabled else None,
+            "densify_mode": getattr(opt, "roi_densify_mode", None) if roi_enabled else None,
+            "prune_background": roi_prune_bg,
+            "mean_fg_frac": roi_mean_fg_frac,
+            "roi_engaged_iter": (opt.roi_warmup_iters + 1) if roi_enabled else None,
+            "densify_gate_start_iter": roi_densify_start if roi_enabled else None,
+            "failopen_views": roi_failopen_count if roi_enabled else 0,
+            "pruned_background_total": stats_bg_pruned_total,
+        },
+    }
+    try:
+        stats_path = os.path.join(dataset.model_path, "train_stats.json")
+        with open(stats_path, "w") as f:
+            json.dump(stats, f, indent=2)
+        print(f"Training stats written to {stats_path}")
+    except OSError as e:
+        print(f"WARNING: could not write train_stats.json: {e}")
     
 def prepare_output_and_logger(args):    
     if not args.model_path:
