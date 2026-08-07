@@ -104,9 +104,19 @@ def build_roi_tensors(class_map, lut, dilate_px):
         weight_f32 = weight0[None]                      # (1,H,W)
         fg_f32 = fg0[None]                               # (1,H,W)
     else:
-        kernel_size = 2 * dilate_px + 1
-        weight_f32 = F.max_pool2d(weight0[None], kernel_size=kernel_size, stride=1, padding=dilate_px)
-        fg_f32 = F.max_pool2d(fg0[None], kernel_size=kernel_size, stride=1, padding=dilate_px)
+        # Separable Chebyshev dilation: two 1-D max pools are mathematically
+        # identical to one (2d+1)x(2d+1) pool for max, and ~14x faster. The full
+        # 2-D pool cost ~30s/view single-threaded at 3800x2533 (2 maps/view x
+        # every training view = the dominant scene-load cost on 1-CPU cluster
+        # jobs); callers should also pass a CUDA class_map when available
+        # (~86 ms/view including upload).
+        k = 2 * dilate_px + 1
+        weight_f32 = F.max_pool2d(
+            F.max_pool2d(weight0[None], kernel_size=(1, k), stride=1, padding=(0, dilate_px)),
+            kernel_size=(k, 1), stride=1, padding=(dilate_px, 0))
+        fg_f32 = F.max_pool2d(
+            F.max_pool2d(fg0[None], kernel_size=(1, k), stride=1, padding=(0, dilate_px)),
+            kernel_size=(k, 1), stride=1, padding=(dilate_px, 0))
 
     weight_map = weight_f32.half()                       # (1,H,W) float16
     roi_bin = (fg_f32[0] > 0).to(torch.uint8)             # (H,W) uint8 in {0,1}

@@ -83,6 +83,11 @@ def load_roi_products(mask_path, expected_size, resolution, dilate_px, lut, miss
     # value set exactly.
     pil_mask = pil_mask.resize(resolution, Image.NEAREST)
     class_map = torch.from_numpy(np.array(pil_mask, dtype=np.uint8))
+    if torch.cuda.is_available():
+        # Build the dilated products on GPU: ~86 ms/view vs seconds/view on a
+        # single-CPU cluster allocation. Camera.__init__ moves the results to
+        # data_device afterwards, so residency is unchanged.
+        class_map = class_map.cuda()
 
     eff_d = 0
     if dilate_px > 0:
