@@ -80,8 +80,9 @@ def test_nearest_resize_preserves_class_id_value_set(tmp_path):
     assert roi_bin.shape == (h // 2, w // 2)
     assert roi_bin.dtype == torch.uint8
 
+    # load_roi_products builds on GPU when available (perf), so compare on CPU.
     allowed = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0], dtype=torch.float16)
-    for v in torch.unique(weight_map):
+    for v in torch.unique(weight_map).cpu():
         assert torch.any(torch.isclose(v, allowed, atol=1e-3)), (
             "unexpected weight value {} -- NEAREST resize may have invented a new class id"
             .format(v.item())
