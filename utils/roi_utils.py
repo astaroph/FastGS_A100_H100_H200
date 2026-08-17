@@ -73,14 +73,27 @@ def parse_class_weights(spec):
     return lut
 
 
-def build_roi_tensors(class_map, lut, dilate_px):
+def build_roi_tensors(class_map, lut, dilate_px, label_scale=1.0, label_class_id=-1,
+                      return_label_bin=False):
     """Build the per-pixel weight map and binary ROI stencil from a class-id map.
 
     class_map: (H,W) uint8 tensor of class ids. lut: 256-entry float32 tensor from
     parse_class_weights (any device). dilate_px: int >= 0, Chebyshev dilation radius
     in pixels, shared by both outputs.
 
-    Returns (weight_map, roi_bin):
+    Optional label extensions (both default-off; the defaults reproduce the original
+    two-tuple outputs bit-for-bit):
+      label_scale / label_class_id: when label_scale != 1.0 and label_class_id >= 0,
+        the LUT weight of exactly that class is multiplied by label_scale BEFORE the
+        dilation-max, so label halos inherit the scaled weight (per-view clarity
+        scalar s_v, FASTGS_ROI_VIEW_WEIGHTING). The scaled value may exceed 1.0 --
+        parse_class_weights' [0,1] clamp governs the base LUT only.
+      return_label_bin: also return a (H,W) uint8 {0,1} stencil of the label class,
+        dilated with the SAME kernel as roi_bin (late label refinement,
+        FASTGS_ROI_LATE_LABEL_REFINE). Requires label_class_id >= 0.
+
+    Returns (weight_map, roi_bin), or (weight_map, roi_bin, label_bin) when
+    return_label_bin is True:
       weight_map: (1,H,W) float16. lut[class_map] grayscale-dilated (each pixel takes
         the max class weight within the Chebyshev radius, so halos inherit the
         strongest neighboring class weight), computed in float32 then cast to half.
@@ -93,6 +106,12 @@ def build_roi_tensors(class_map, lut, dilate_px):
     """
     if dilate_px < 0:
         raise ValueError("dilate_px must be >= 0, got {}".format(dilate_px))
+    if return_label_bin and label_class_id < 0:
+        raise ValueError("return_label_bin=True requires label_class_id >= 0")
+    if label_scale != 1.0 and label_class_id < 0:
+        raise ValueError("label_scale != 1.0 requires label_class_id >= 0")
+    if not math.isfinite(label_scale) or label_scale < 0.0:
+        raise ValueError("label_scale must be finite and >= 0, got {}".format(label_scale))
 
     lut = lut.to(device=class_map.device, dtype=torch.float32)
     class_ids_long = class_map.long()
@@ -100,27 +119,51 @@ def build_roi_tensors(class_map, lut, dilate_px):
     weight0 = lut[class_ids_long]                      # (H,W) float32
     fg0 = (class_map > 0).to(torch.float32)             # (H,W) float32
 
-    if dilate_px == 0:
-        weight_f32 = weight0[None]                      # (1,H,W)
-        fg_f32 = fg0[None]                               # (1,H,W)
-    else:
+    label0 = None
+    if label_class_id >= 0 and (label_scale != 1.0 or return_label_bin):
+        label_mask = class_ids_long == int(label_class_id)
+        if label_scale != 1.0:
+            # Pre-dilation so the halo's max-pool inherits the scaled label weight.
+            weight0 = torch.where(label_mask, weight0 * float(label_scale), weight0)
+        if return_label_bin:
+            label0 = label_mask.to(torch.float32)
+
+    def _dilate(x2d):
         # Separable Chebyshev dilation: two 1-D max pools are mathematically
         # identical to one (2d+1)x(2d+1) pool for max, and ~14x faster. The full
         # 2-D pool cost ~30s/view single-threaded at 3800x2533 (2 maps/view x
         # every training view = the dominant scene-load cost on 1-CPU cluster
         # jobs); callers should also pass a CUDA class_map when available
         # (~86 ms/view including upload).
+        if dilate_px == 0:
+            return x2d[None]
         k = 2 * dilate_px + 1
-        weight_f32 = F.max_pool2d(
-            F.max_pool2d(weight0[None], kernel_size=(1, k), stride=1, padding=(0, dilate_px)),
+        return F.max_pool2d(
+            F.max_pool2d(x2d[None], kernel_size=(1, k), stride=1, padding=(0, dilate_px)),
             kernel_size=(k, 1), stride=1, padding=(dilate_px, 0))
-        fg_f32 = F.max_pool2d(
-            F.max_pool2d(fg0[None], kernel_size=(1, k), stride=1, padding=(0, dilate_px)),
-            kernel_size=(k, 1), stride=1, padding=(dilate_px, 0))
+
+    weight_f32 = _dilate(weight0)
+    fg_f32 = _dilate(fg0)
+
+    if label_class_id >= 0 and label_scale != 1.0:
+        # Post-dilation exactness restore. The shared max-dilation lets a
+        # HIGHER-weighted neighbor within dilate_px overwrite a DOWN-scaled
+        # (label_scale < 1, e.g. renormalized unclear views) label pixel's own
+        # weight â€” total erosion for labels narrower than 2*dilate_px. Halo
+        # pixels keep max semantics (an up-scaled label still bleeds outward);
+        # the label's OWN pixels always end at exactly lut[label] * label_scale
+        # (a no-op numerically when label_scale >= 1, where the max already
+        # picked the scaled value).
+        label_val = float(lut[int(label_class_id)].item()) * float(label_scale)
+        weight_f32 = torch.where(
+            label_mask[None], torch.full_like(weight_f32, label_val), weight_f32)
 
     weight_map = weight_f32.half()                       # (1,H,W) float16
     roi_bin = (fg_f32[0] > 0).to(torch.uint8)             # (H,W) uint8 in {0,1}
 
+    if return_label_bin:
+        label_bin = (_dilate(label0)[0] > 0).to(torch.uint8)  # (H,W) uint8 in {0,1}
+        return weight_map, roi_bin, label_bin
     return weight_map, roi_bin
 
 

@@ -55,7 +55,7 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
 
-        # ROI (FastGS + LightSeg) parameters — all default-off / byte-identical when
+        # ROI (FastGS + LightSeg) parameters â€” all default-off / byte-identical when
         # use_roi_masks is False. See docs/FASTGS_ROI_lightseg_implementation_plan_2026-08-06.md.
         self.use_roi_masks = False
         self.roi_masks_dir = ""
@@ -63,6 +63,14 @@ class ModelParams(ParamGroup):
         self.roi_dilate_px = 12
         self.roi_missing = "fail_open"  # or "fail_loud"
         self.roi_max_failopen_frac = 0.10
+        # Per-view clarity scalars (FASTGS_ROI_VIEW_WEIGHTING): path to the
+        # roi_view_weights.json emitted by the pipeline's stats tool. "" = off.
+        self.roi_view_weights_json = ""
+        # Late label refinement (FASTGS_ROI_LATE_LABEL_REFINE): keep a per-camera
+        # dilated label stencil at scene load. Class id defaults to the LightSeg
+        # 5-class map's label id; the view-weights JSON overrides it when present.
+        self.roi_keep_label_bin = False
+        self.roi_label_class_id = 2
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -108,10 +116,10 @@ class OptimizationParams(ParamGroup):
         self.dense = 0.001
         self.mult = 0.5      # multiplier for the compact box to control the tile number of each splat
 
-        # ROI (FastGS + LightSeg) parameters — consumed by train.py's ROI training-loop
+        # ROI (FastGS + LightSeg) parameters â€” consumed by train.py's ROI training-loop
         # integration (loss weighting, densify gating, background prune, schedules).
         # NOTE: OptimizationParams are NOT persisted in cfg_args (only ModelParams are).
-        # See docs/FASTGS_ROI_lightseg_implementation_plan_2026-08-06.md §4.1.
+        # See docs/FASTGS_ROI_lightseg_implementation_plan_2026-08-06.md Â§4.1.
         self.roi_warmup_iters = 1000
         self.roi_ramp_iters = 300
         self.roi_norm = "global"  # or "roi"
@@ -123,6 +131,13 @@ class OptimizationParams(ParamGroup):
         self.roi_prune_start_iter = 3000
         self.roi_prune_min_rounds = 2
         self.roi_prune_min_keep = 1024
+        # Late label refinement (FASTGS_ROI_LATE_LABEL_REFINE): boost label-pixel loss
+        # weight after densification ends. Requires --roi_keep_label_bin (ModelParams)
+        # so the label stencils exist. -1 start = resolved to densify_until_iter.
+        self.roi_late_refine = False
+        self.roi_refine_label_mult = 2.0
+        self.roi_refine_start_iter = -1
+        self.roi_refine_ramp_iters = 300
         self.score_num_cameras = 10
         self.final_prune_interval = 3000
         self.final_prune_until_iter = 30000

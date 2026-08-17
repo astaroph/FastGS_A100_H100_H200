@@ -5,7 +5,7 @@ ROI kwargs, and scene/dataset_readers.py::CameraInfo's new defaulted fields. The
 load_roi_products tests are CPU-only; the Camera/loadCam tests require a CUDA-capable
 torch build (Camera.__init__ unconditionally .cuda()s its view/projection matrices) and
 are skipped otherwise. See
-docs/FASTGS_ROI_lightseg_implementation_plan_2026-08-06.md §4.1/§4.3 (mcz-3dgs-label-pipeline
+docs/FASTGS_ROI_lightseg_implementation_plan_2026-08-06.md Â§4.1/Â§4.3 (mcz-3dgs-label-pipeline
 repo) for the design this implements.
 """
 
@@ -19,7 +19,7 @@ import torch
 from PIL import Image
 
 # Camera.__init__ calls .cuda() on world_view_transform/projection_matrix regardless of
-# data_device — the Camera/loadCam tests below cannot run on a CPU-only torch build.
+# data_device â€” the Camera/loadCam tests below cannot run on a CPU-only torch build.
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Camera.__init__ requires a CUDA-capable torch"
 )
@@ -31,7 +31,7 @@ except ImportError:
     # submodules/simple-knn/ -- it needs a full MSVC+CUDA toolchain to compile on Windows).
     # It is required only by scene.gaussian_model's distCUDA2, which none of these ROI-loading
     # unit tests exercise; stub it so `scene.cameras` / `scene.dataset_readers` import cleanly
-    # here. Cluster envs (§11) have the real extension built and use it unmodified.
+    # here. Cluster envs (Â§11) have the real extension built and use it unmodified.
     _simple_knn_stub = types.ModuleType("simple_knn")
     _simple_knn_c_stub = types.ModuleType("simple_knn._C")
 
@@ -71,7 +71,7 @@ def test_nearest_resize_preserves_class_id_value_set(tmp_path):
     lut = roi_utils.parse_class_weights("0:0.0,1:0.25,2:0.5,3:0.75,4:1.0")
     resolution = (w // 2, h // 2)
 
-    weight_map, roi_bin, failopen = load_roi_products(
+    weight_map, roi_bin, _label_bin, failopen = load_roi_products(
         str(mask_path), (w, h), resolution, 0, lut, "fail_open")
 
     assert not failopen
@@ -97,7 +97,7 @@ def test_missing_file_fail_open_returns_none_none_true(tmp_path):
     lut = roi_utils.parse_class_weights(DEFAULT_WEIGHTS_SPEC)
     missing_path = str(tmp_path / "does_not_exist.png")
 
-    weight_map, roi_bin, failopen = load_roi_products(
+    weight_map, roi_bin, _label_bin, failopen = load_roi_products(
         missing_path, (8, 6), (8, 6), 0, lut, "fail_open")
 
     assert weight_map is None
@@ -120,7 +120,7 @@ def test_size_mismatch_fail_open_returns_none_none_true(tmp_path):
     lut = roi_utils.parse_class_weights(DEFAULT_WEIGHTS_SPEC)
 
     # mask is actually 8x6; claim the source image was 10x10 -> mismatch.
-    weight_map, roi_bin, failopen = load_roi_products(
+    weight_map, roi_bin, _label_bin, failopen = load_roi_products(
         str(mask_path), (10, 10), (10, 10), 0, lut, "fail_open")
 
     assert weight_map is None
@@ -157,7 +157,7 @@ def test_dilate_px_scaled_to_resolution_gives_expected_halo_radius(tmp_path):
     lut = roi_utils.parse_class_weights("0:0.0,1:1.0")
 
     # dilate_px=0 baseline: locate the surviving foreground pixel at resolution scale.
-    _, roi_bin_0, failopen0 = load_roi_products(
+    _, roi_bin_0, _lb0, failopen0 = load_roi_products(
         str(mask_path), expected_size, resolution, 0, lut, "fail_open")
     assert not failopen0
     ys, xs = torch.nonzero(roi_bin_0, as_tuple=True)
@@ -169,7 +169,7 @@ def test_dilate_px_scaled_to_resolution_gives_expected_halo_radius(tmp_path):
     assert 7 <= c0 <= resolution[0] - 8
 
     # dilate_px=12 at half resolution -> eff_d = round(12 * 40/80) = 6.
-    weight_map, roi_bin_12, failopen12 = load_roi_products(
+    weight_map, roi_bin_12, _lb12, failopen12 = load_roi_products(
         str(mask_path), expected_size, resolution, 12, lut, "fail_open")
     assert not failopen12
     assert weight_map.shape == (1, resolution[1], resolution[0])

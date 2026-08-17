@@ -11,6 +11,7 @@
 
 import torch
 import numpy as np
+import math
 import os, random, time, json
 from random import randint
 from types import SimpleNamespace
@@ -48,6 +49,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     roi_prune_bg = False
     roi_failopen_count = 0
     roi_mean_fg_frac = None
+    # Late label refinement (FASTGS_ROI_LATE_LABEL_REFINE) â€” resolved here, engaged in
+    # the loss block only (densify/prune maps untouched by design; the densification
+    # window is over before it starts).
+    roi_refine = bool(getattr(opt, "roi_late_refine", False))
+    roi_refine_start = 0
+    roi_refine_mult = 1.0
+    roi_refine_ramp = 0
+    roi_vieww_json = str(getattr(dataset, "roi_view_weights_json", "") or "")
+    if roi_vieww_json and not roi_enabled:
+        raise RuntimeError(
+            "[ROI-VIEWW] --roi_view_weights_json requires --use_roi_masks (there is no "
+            "weight map to scale without ROI masks).")
+    if roi_refine and not roi_enabled:
+        raise RuntimeError(
+            "[ROI-REFINE] --roi_late_refine requires --use_roi_masks (there is no "
+            "weight map to boost without ROI masks).")
+    if roi_refine and not bool(getattr(dataset, "roi_keep_label_bin", False)):
+        raise RuntimeError(
+            "[ROI-REFINE] --roi_late_refine requires --roi_keep_label_bin so the "
+            "per-camera label stencils exist; refusing to run a silently-inert arm.")
+    if roi_refine:
+        roi_refine_mult = float(getattr(opt, "roi_refine_label_mult", 2.0))
+        if not math.isfinite(roi_refine_mult) or roi_refine_mult < 1.0:
+            raise RuntimeError(
+                "[ROI-REFINE] --roi_refine_label_mult must be finite and >= 1.0, got {}".format(
+                    roi_refine_mult))
+        if roi_refine_mult == 1.0:
+            print("[ROI-REFINE] WARNING: --roi_refine_label_mult 1.0 makes the refinement "
+                  "arm a mathematical identity; it will run but change nothing.")
+        start = int(getattr(opt, "roi_refine_start_iter", -1))
+        roi_refine_start = start if start >= 0 else int(opt.densify_until_iter)
+        roi_refine_ramp = max(0, int(getattr(opt, "roi_refine_ramp_iters", 300)))
+        if roi_refine_start < int(opt.densify_until_iter):
+            print("[ROI-REFINE] clamping roi_refine_start_iter {} -> {} (refinement must "
+                  "not overlap the densification window; its gradients feed the densify "
+                  "grad gate)".format(roi_refine_start, int(opt.densify_until_iter)))
+            roi_refine_start = int(opt.densify_until_iter)
+        if roi_refine_start >= int(opt.iterations):
+            raise RuntimeError(
+                "[ROI-REFINE] roi_refine_start_iter {} >= --iterations {}: the refinement "
+                "arm could never engage this run; refusing to run a silently-inert "
+                "arm.".format(roi_refine_start, int(opt.iterations)))
     if roi_enabled:
         if opt.roi_norm not in ("roi", "global"):
             raise RuntimeError(
@@ -96,6 +139,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         roi_failopen_count = sum(
             1 for cam in train_cams if getattr(cam, "roi_weight", None) is None
         )
+        if roi_refine:
+            n_lb = sum(1 for cam in train_cams
+                       if getattr(cam, "roi_label_bin", None) is not None)
+            n_masked = len(train_cams) - roi_failopen_count
+            if n_lb < n_masked:
+                raise RuntimeError(
+                    "[ROI-REFINE] only {}/{} masked training views carry a label stencil; "
+                    "--roi_keep_label_bin should have populated all of them.".format(
+                        n_lb, n_masked))
+            print("[ROI-REFINE] enabled | start iter {} | label mult {} | ramp {} | "
+                  "stencils {}/{} views".format(
+                      roi_refine_start, roi_refine_mult, roi_refine_ramp, n_lb,
+                      len(train_cams)))
+        if roi_vieww_json:
+            n_scaled = 0
+            with torch.no_grad():
+                for cam in train_cams:
+                    w = getattr(cam, "roi_weight", None)
+                    if w is not None and float(w.float().max().item()) > 1.0:
+                        n_scaled += 1
+            print("[ROI-VIEWW] enabled | weights json {} | views with max weight > 1.0: "
+                  "{}/{}".format(roi_vieww_json, n_scaled, len(train_cams)))
         max_frac = float(getattr(dataset, "roi_max_failopen_frac", 0.10))
         if len(train_cams) > 0 and roi_failopen_count / len(train_cams) > max_frac:
             raise RuntimeError(
@@ -202,6 +267,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # moments right as densify events compare raw gradients to fixed
                 # thresholds; ramping removes the transient.
                 roi_W = (1.0 - ramp_t) + ramp_t * roi_W
+            # Late label refinement: boost label pixels only, only after the
+            # densification window (roi_refine_start >= densify_until_iter, clamped
+            # above), with its own linear ramp. Multiplies AFTER the warmup ramp;
+            # ramp_t is 1.0 by then so composition order is moot but kept explicit.
+            if roi_refine and iteration > roi_refine_start:
+                label_bin = getattr(viewpoint_cam, "roi_label_bin", None)
+                if label_bin is not None:
+                    if roi_refine_ramp > 0:
+                        refine_t = min(1.0, (iteration - roi_refine_start) / float(roi_refine_ramp))
+                    else:
+                        refine_t = 1.0
+                    eff_mult = 1.0 + (roi_refine_mult - 1.0) * refine_t
+                    roi_W = roi_W * (1.0 + (eff_mult - 1.0) * label_bin.cuda().float())
             Ll1 = masked_l1(image, gt_image, roi_W, opt.roi_norm)
             ssim_value = masked_ssim(image.unsqueeze(0), gt_image.unsqueeze(0), roi_W, opt.roi_norm)
         else:
@@ -390,6 +468,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "pruned_background_total": stats_bg_pruned_total,
         },
     }
+    # Arm keys are added only when the respective arm ran, so arm-off runs keep a
+    # byte-identical train_stats.json (same discipline as the toolchain JSON).
+    if roi_vieww_json:
+        stats["roi"]["view_weights_json"] = roi_vieww_json
+    if roi_refine:
+        stats["roi"]["late_refine"] = {
+            "enabled": True,
+            "start_iter": roi_refine_start,
+            "label_mult": roi_refine_mult,
+            "ramp_iters": roi_refine_ramp,
+        }
     try:
         stats_path = os.path.join(dataset.model_path, "train_stats.json")
         with open(stats_path, "w") as f:
