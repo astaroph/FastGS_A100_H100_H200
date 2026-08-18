@@ -73,6 +73,71 @@ def parse_class_weights(spec):
     return lut
 
 
+def parse_densify_class_weights(spec):
+    """Parse a comma-separated "id:weight" spec into densify weight groups.
+
+    spec: e.g. "2:2.0,3:2.0,1:0.5" -- class ids as in the mask PNGs. Unlike
+    parse_class_weights, weights may exceed 1.0 (they scale densification
+    importance counts, not loss weights); ids not listed implicitly weight 1.0.
+
+    Returns: list of (weight, [class_ids]) groups -- ids sharing a weight are
+    grouped so the densify pass renders one metric map per distinct weight, not
+    per class. Group order is deterministic (first appearance of each weight).
+    Entries with weight exactly 1.0 are dropped (identity; the unlisted-classes
+    remainder already renders at weight 1.0).
+
+    Raises ValueError on: empty spec / no valid entries, malformed pairs,
+    non-integer or out-of-range [0,255] ids, duplicate ids, non-finite or
+    negative weights, or a spec whose every entry is 1.0 (a fully-identity spec
+    is a config mistake, not a feature).
+    """
+    if spec is None or not str(spec).strip():
+        raise ValueError("densify class-weight spec is empty: {!r}".format(spec))
+
+    seen_ids = set()
+    groups = []          # list of [weight, [ids]] in first-appearance order
+    by_weight = {}
+    n_valid = 0
+    for raw_pair in str(spec).split(","):
+        pair = raw_pair.strip()
+        if not pair:
+            continue
+        parts = pair.split(":")
+        if len(parts) != 2:
+            raise ValueError(
+                "malformed densify class-weight pair {!r} in spec {!r} (expected 'id:weight')".format(pair, spec))
+        try:
+            class_id = int(parts[0].strip())
+        except ValueError:
+            raise ValueError("class id {!r} in pair {!r} is not an integer".format(parts[0], pair))
+        try:
+            weight = float(parts[1].strip())
+        except ValueError:
+            raise ValueError("weight {!r} in pair {!r} is not a float".format(parts[1], pair))
+        if not (0 <= class_id <= 255):
+            raise ValueError("class id {} in pair {!r} is out of range [0, 255]".format(class_id, pair))
+        if class_id in seen_ids:
+            raise ValueError("duplicate class id {} in spec {!r}".format(class_id, spec))
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError("weight {} for class id {} must be finite and >= 0".format(weight, class_id))
+        seen_ids.add(class_id)
+        n_valid += 1
+        if weight == 1.0:
+            continue  # identity entry: same as leaving the class unlisted
+        if weight not in by_weight:
+            by_weight[weight] = []
+            groups.append([weight, by_weight[weight]])
+        by_weight[weight].append(class_id)
+
+    if n_valid == 0:
+        raise ValueError("no valid entries parsed from densify class-weight spec {!r}".format(spec))
+    if not groups:
+        raise ValueError(
+            "densify class-weight spec {!r} is entirely weight-1.0 entries (an identity "
+            "spec); leave the flag unset instead".format(spec))
+    return [(w, list(ids)) for w, ids in groups]
+
+
 def build_roi_tensors(class_map, lut, dilate_px, label_scale=1.0, label_class_id=-1,
                       return_label_bin=False):
     """Build the per-pixel weight map and binary ROI stencil from a class-id map.
@@ -149,7 +214,7 @@ def build_roi_tensors(class_map, lut, dilate_px, label_scale=1.0, label_class_id
         # Post-dilation exactness restore. The shared max-dilation lets a
         # HIGHER-weighted neighbor within dilate_px overwrite a DOWN-scaled
         # (label_scale < 1, e.g. renormalized unclear views) label pixel's own
-        # weight â€” total erosion for labels narrower than 2*dilate_px. Halo
+        # weight — total erosion for labels narrower than 2*dilate_px. Halo
         # pixels keep max semantics (an up-scaled label still bleeds outward);
         # the label's OWN pixels always end at exactly lut[label] * label_scale
         # (a no-op numerically when label_scale >= 1, where the max already

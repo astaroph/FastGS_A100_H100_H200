@@ -76,6 +76,56 @@ def normalize(config_value, value_tensor):
     return ret_value
 
 
+def _class_weighted_counts(cam, gaussians, pipe, bg, args, dmap, groups):
+    """Per-gaussian densify counts with per-class weights (float result).
+
+    Splits the flagged map into one BINARY metric map per distinct weight (ids
+    sharing a weight are grouped by parse_densify_class_weights) and renders each
+    through the existing get_flag path -- the CUDA kernel counts
+    metric_map[pix] == 1 EXACTLY, so scaled map values would be silently dropped;
+    weighting therefore happens on the counts, never inside the map. Flagged
+    pixels whose class is in no group (including dilation-halo pixels whose raw
+    class is background) keep weight 1.0 via the remainder render. Requires
+    cam.roi_class_map (train.py validates coverage at startup).
+    """
+    class_map = getattr(cam, "roi_class_map", None)
+    if class_map is None:
+        raise RuntimeError(
+            "[ROI-DENSIFY-CW] camera {!r} has no roi_class_map; startup validation "
+            "should have caught this".format(getattr(cam, "image_name", "?")))
+    cm = class_map.to(dmap.device)
+    remaining = dmap > 0
+    weighted = None
+    for weight, ids in groups:
+        gmask = torch.zeros_like(remaining)
+        for cid in ids:
+            gmask |= (cm == int(cid))
+        sel = remaining & gmask
+        remaining = remaining & ~gmask
+        if weight == 0.0:
+            # Pixels are consumed (excluded from the weight-1.0 remainder) but a
+            # render whose counts get multiplied by zero is pure waste.
+            continue
+        if not bool(sel.any()):
+            continue
+        counts = render_fastgs(
+            cam, gaussians, pipe, bg, args.mult,
+            get_flag=True, metric_map=sel.int(),
+        )["accum_metric_counts"]
+        contrib = counts.float() * float(weight)
+        weighted = contrib if weighted is None else weighted + contrib
+    if bool(remaining.any()):
+        counts = render_fastgs(
+            cam, gaussians, pipe, bg, args.mult,
+            get_flag=True, metric_map=remaining.int(),
+        )["accum_metric_counts"]
+        weighted = counts.float() if weighted is None else weighted + counts.float()
+    if weighted is None:
+        weighted = torch.zeros(
+            gaussians.get_xyz.shape[0], dtype=torch.float32, device=dmap.device)
+    return weighted
+
+
 def compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, args, DENSIFY=False, roi_cfg=None):
     """
     Compute multi-view consistency scores for Gaussians to guide densification/pruning.
@@ -113,6 +163,7 @@ def compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, args, DENSIFY=Fa
 
     roi_active = roi_cfg is not None and getattr(roi_cfg, "densify_active", False)
     track_touch = roi_cfg is not None and getattr(roi_cfg, "track_roi_touch", False)
+    cw_groups = getattr(roi_cfg, "class_weight_groups", None) if roi_cfg is not None else None
 
     densify_counts = None
     blend_outside_counts = None
@@ -154,8 +205,13 @@ def compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, args, DENSIFY=Fa
             if not roi_active:
                 d_counts = prune_counts
             elif roi_bin is None:
-                # fail-open view: zero densification contribution
-                d_counts = torch.zeros_like(prune_counts)
+                # fail-open view: zero densification contribution. Float when class
+                # weighting is on so accumulation dtype stays consistent with the
+                # weighted counts from masked views.
+                if cw_groups:
+                    d_counts = torch.zeros_like(prune_counts, dtype=torch.float32)
+                else:
+                    d_counts = torch.zeros_like(prune_counts)
                 if roi_cfg.densify_mode == "blend":
                     o_counts = torch.zeros_like(prune_counts)
             else:
@@ -163,10 +219,14 @@ def compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, args, DENSIFY=Fa
                 dmap = ((normalize_map_roi(raw_map, roi_mask) > args.loss_thresh) & roi_mask).int()
                 flagged_px_total += float(dmap.sum().item())
                 flagged_px_views += 1
-                d_counts = render_fastgs(
-                    my_viewpoint_cam, gaussians, pipe, bg, args.mult,
-                    get_flag=True, metric_map=dmap,
-                )["accum_metric_counts"]
+                if cw_groups:
+                    d_counts = _class_weighted_counts(
+                        my_viewpoint_cam, gaussians, pipe, bg, args, dmap, cw_groups)
+                else:
+                    d_counts = render_fastgs(
+                        my_viewpoint_cam, gaussians, pipe, bg, args.mult,
+                        get_flag=True, metric_map=dmap,
+                    )["accum_metric_counts"]
                 if roi_cfg.densify_mode == "blend":
                     # Deliberate deviation from the plan's count-subtraction formula:
                     # dmap is ROI-locally normalized while prune_map is full-frame
@@ -229,6 +289,10 @@ def compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, args, DENSIFY=Fa
             importance_score = (
                 densify_counts.float() + float(roi_cfg.bg_scale) * outside.float()
             ) / float(len(camlist))
+        elif roi_active and cw_groups:
+            # Class-weighted counts are float; floor division would zero the
+            # fractional weights, so use true division (blend-branch precedent).
+            importance_score = densify_counts.float() / float(len(camlist))
         else:
             importance_score = torch.div(densify_counts, len(camlist), rounding_mode="floor")
     else:

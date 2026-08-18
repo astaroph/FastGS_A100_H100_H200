@@ -510,7 +510,10 @@ class GaussianModel:
 
         # This is our multi-view consisent metric for densification
         # We use this metric to further filter the candidates for densification, which is similar to taming 3dgs.
-        metric_mask = importance_score > 5
+        # Gate exposed as --densify_metric_gate (default 5 = the historical literal, so
+        # default runs are byte-identical). Class-scoped densify weighting (fast_utils)
+        # produces float importance scores; the comparison is dtype-agnostic.
+        metric_mask = importance_score > float(getattr(args, "densify_metric_gate", 5))
 
         self.densify_and_clone_fastgs(metric_mask, all_clones)
         self.densify_and_split_fastgs(metric_mask, all_splits)

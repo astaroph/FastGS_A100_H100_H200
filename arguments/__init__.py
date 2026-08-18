@@ -55,7 +55,7 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
 
-        # ROI (FastGS + LightSeg) parameters â€” all default-off / byte-identical when
+        # ROI (FastGS + LightSeg) parameters — all default-off / byte-identical when
         # use_roi_masks is False. See docs/FASTGS_ROI_lightseg_implementation_plan_2026-08-06.md.
         self.use_roi_masks = False
         self.roi_masks_dir = ""
@@ -71,6 +71,11 @@ class ModelParams(ParamGroup):
         # 5-class map's label id; the view-weights JSON overrides it when present.
         self.roi_keep_label_bin = False
         self.roi_label_class_id = 2
+        # Class-scoped densify weighting (FASTGS_ROI_DENSIFY_CLASS_WEIGHTS):
+        # "id:weight" spec scaling densification importance counts per class
+        # (e.g. "2:2.0,3:2.0,1:0.5"). "" = off. Lives in ModelParams because scene
+        # load must keep the per-camera class maps when it is set.
+        self.roi_densify_class_weights = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -116,10 +121,10 @@ class OptimizationParams(ParamGroup):
         self.dense = 0.001
         self.mult = 0.5      # multiplier for the compact box to control the tile number of each splat
 
-        # ROI (FastGS + LightSeg) parameters â€” consumed by train.py's ROI training-loop
+        # ROI (FastGS + LightSeg) parameters — consumed by train.py's ROI training-loop
         # integration (loss weighting, densify gating, background prune, schedules).
         # NOTE: OptimizationParams are NOT persisted in cfg_args (only ModelParams are).
-        # See docs/FASTGS_ROI_lightseg_implementation_plan_2026-08-06.md Â§4.1.
+        # See docs/FASTGS_ROI_lightseg_implementation_plan_2026-08-06.md §4.1.
         self.roi_warmup_iters = 1000
         self.roi_ramp_iters = 300
         self.roi_norm = "global"  # or "roi"
@@ -138,6 +143,12 @@ class OptimizationParams(ParamGroup):
         self.roi_refine_label_mult = 2.0
         self.roi_refine_start_iter = -1
         self.roi_refine_ramp_iters = 300
+        # Solidity dials — defaults equal the historical hardcoded literals, so
+        # default runs are byte-identical (docs/FASTGS_ROI_VIEW_WEIGHTING_plan §19).
+        self.densify_min_opacity = 0.005
+        self.final_prune_min_opacity = 0.05
+        self.final_prune_score_thresh = 0.95
+        self.densify_metric_gate = 5.0
         self.score_num_cameras = 10
         self.final_prune_interval = 3000
         self.final_prune_until_iter = 30000

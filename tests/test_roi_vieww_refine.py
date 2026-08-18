@@ -84,7 +84,7 @@ def test_label_scale_may_exceed_one():
 def test_label_downweight_survives_dilation_next_to_higher_neighbor():
     # Adversarial-review finding: the shared max-dilation used to ERASE a
     # down-scaled (s < 1, renormalized unclear view) label weight wherever a
-    # higher-weighted class sits within dilate_px â€” 100% erosion for labels
+    # higher-weighted class sits within dilate_px — 100% erosion for labels
     # narrower than 2*dilate_px. The post-dilation exactness restore must keep
     # the label's OWN pixels at exactly lut[label] * s.
     m = torch.zeros((12, 12), dtype=torch.uint8)
@@ -200,15 +200,15 @@ def _write_mask(tmp_path, arr):
 
 
 def test_load_roi_products_failopen_returns_four_nones_and_flag(tmp_path):
-    w, b, lb, fo = camera_utils.load_roi_products(
+    w, b, lb, cm, fo = camera_utils.load_roi_products(
         str(tmp_path / "missing.png"), (12, 12), (12, 12), 0, LUT, "fail_open")
-    assert w is None and b is None and lb is None and fo is True
+    assert w is None and b is None and lb is None and cm is None and fo is True
 
 
 def test_load_roi_products_default_matches_direct_build(tmp_path):
     m = _class_map()
     mp = _write_mask(tmp_path, m)
-    w, b, lb, fo = camera_utils.load_roi_products(mp, (12, 12), (12, 12), 0, LUT, "fail_open")
+    w, b, lb, cm, fo = camera_utils.load_roi_products(mp, (12, 12), (12, 12), 0, LUT, "fail_open")
     assert fo is False and lb is None
     w_ref, b_ref = roi_utils.build_roi_tensors(m.to(w.device), LUT, 0)
     assert torch.equal(w.cpu(), w_ref.cpu())
@@ -218,7 +218,7 @@ def test_load_roi_products_default_matches_direct_build(tmp_path):
 def test_load_roi_products_scale_and_stencil(tmp_path):
     m = _class_map()
     mp = _write_mask(tmp_path, m)
-    w, b, lb, fo = camera_utils.load_roi_products(
+    w, b, lb, cm, fo = camera_utils.load_roi_products(
         mp, (12, 12), (12, 12), 0, LUT, "fail_open",
         label_scale=1.5, label_class_id=2, want_label_bin=True)
     assert fo is False

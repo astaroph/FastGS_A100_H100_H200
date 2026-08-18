@@ -17,7 +17,8 @@ from random import randint
 from types import SimpleNamespace
 from lpipsPyTorch import lpips
 from utils.loss_utils import l1_loss
-from utils.roi_utils import parse_class_weights, masked_l1, masked_ssim
+from utils.roi_utils import (parse_class_weights, parse_densify_class_weights,
+                             masked_l1, masked_ssim)
 from fused_ssim import fused_ssim as fast_ssim
 from gaussian_renderer import render_fastgs, network_gui_ws
 import sys
@@ -49,7 +50,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     roi_prune_bg = False
     roi_failopen_count = 0
     roi_mean_fg_frac = None
-    # Late label refinement (FASTGS_ROI_LATE_LABEL_REFINE) â€” resolved here, engaged in
+    # Late label refinement (FASTGS_ROI_LATE_LABEL_REFINE) — resolved here, engaged in
     # the loss block only (densify/prune maps untouched by design; the densification
     # window is over before it starts).
     roi_refine = bool(getattr(opt, "roi_late_refine", False))
@@ -91,6 +92,32 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "[ROI-REFINE] roi_refine_start_iter {} >= --iterations {}: the refinement "
                 "arm could never engage this run; refusing to run a silently-inert "
                 "arm.".format(roi_refine_start, int(opt.iterations)))
+    # --- Solidity dials (always-on args with defaults equal to the historical
+    # literals, so default runs are byte-identical; validated unconditionally) ---
+    densify_min_opacity = float(getattr(opt, "densify_min_opacity", 0.005))
+    final_prune_min_opacity = float(getattr(opt, "final_prune_min_opacity", 0.05))
+    final_prune_score_thresh = float(getattr(opt, "final_prune_score_thresh", 0.95))
+    densify_metric_gate = float(getattr(opt, "densify_metric_gate", 5.0))
+    if not (0.0 < densify_min_opacity < 1.0):
+        raise RuntimeError("--densify_min_opacity must be in (0,1), got {}".format(densify_min_opacity))
+    if not (0.0 < final_prune_min_opacity < 1.0):
+        raise RuntimeError("--final_prune_min_opacity must be in (0,1), got {}".format(final_prune_min_opacity))
+    if not (0.0 < final_prune_score_thresh <= 1.0):
+        raise RuntimeError("--final_prune_score_thresh must be in (0,1], got {}".format(final_prune_score_thresh))
+    if not math.isfinite(densify_metric_gate) or densify_metric_gate < 0.0:
+        raise RuntimeError("--densify_metric_gate must be finite and >= 0, got {}".format(densify_metric_gate))
+    # --- Class-scoped densify weighting (FASTGS_ROI_DENSIFY_CLASS_WEIGHTS) ---
+    roi_densify_cw_spec = str(getattr(dataset, "roi_densify_class_weights", "") or "")
+    roi_densify_cw_groups = None
+    if roi_densify_cw_spec:
+        if not roi_enabled:
+            raise RuntimeError(
+                "[ROI-DENSIFY-CW] --roi_densify_class_weights requires --use_roi_masks "
+                "(class maps come from the ROI mask products).")
+        try:
+            roi_densify_cw_groups = parse_densify_class_weights(roi_densify_cw_spec)
+        except ValueError as exc:
+            raise RuntimeError("[ROI-DENSIFY-CW] bad --roi_densify_class_weights: {}".format(exc))
     if roi_enabled:
         if opt.roi_norm not in ("roi", "global"):
             raise RuntimeError(
@@ -161,6 +188,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         n_scaled += 1
             print("[ROI-VIEWW] enabled | weights json {} | views with max weight > 1.0: "
                   "{}/{}".format(roi_vieww_json, n_scaled, len(train_cams)))
+        if roi_densify_cw_groups is not None:
+            n_cm = sum(1 for cam in train_cams
+                       if getattr(cam, "roi_class_map", None) is not None)
+            n_masked = len(train_cams) - roi_failopen_count
+            if n_cm < n_masked:
+                raise RuntimeError(
+                    "[ROI-DENSIFY-CW] only {}/{} masked training views carry a class map; "
+                    "--roi_densify_class_weights should have populated all of them.".format(
+                        n_cm, n_masked))
+            print("[ROI-DENSIFY-CW] enabled | groups {} | class maps {}/{} views".format(
+                [(w, ids) for w, ids in roi_densify_cw_groups], n_cm, len(train_cams)))
         max_frac = float(getattr(dataset, "roi_max_failopen_frac", 0.10))
         if len(train_cams) > 0 and roi_failopen_count / len(train_cams) > max_frac:
             raise RuntimeError(
@@ -327,6 +365,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             bg_scale=opt.roi_densify_bg_scale,
                             track_roi_touch=roi_prune_bg,
                             last_flagged_px_mean=None,
+                            class_weight_groups=roi_densify_cw_groups,
                         )
 
                     # The multiview consistent densification of fastgs
@@ -339,7 +378,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                     n_before_densify = gaussians.get_xyz.shape[0]
                     gaussians.densify_and_prune_fastgs(max_screen_size = size_threshold,
-                                                min_opacity = 0.005,
+                                                min_opacity = densify_min_opacity,
                                                 extent = scene.cameras_extent,
                                                 radii=radii,
                                                 args = opt,
@@ -399,9 +438,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 # Gentler late prune for label-mode stability
                 gaussians.final_prune_fastgs(
-                    min_opacity=0.05,
+                    min_opacity=final_prune_min_opacity,
                     pruning_score=pruning_score,
-                    score_thresh=0.95,
+                    score_thresh=final_prune_score_thresh,
                     min_keep=1024,
                 )
 
@@ -479,6 +518,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "label_mult": roi_refine_mult,
             "ramp_iters": roi_refine_ramp,
         }
+    if roi_densify_cw_spec:
+        stats["roi"]["densify_class_weights"] = roi_densify_cw_spec
+    # Solidity dials recorded only when moved off their historical literals, so
+    # default runs keep a byte-identical train_stats.json.
+    _dials = {"densify_min_opacity": (densify_min_opacity, 0.005),
+              "final_prune_min_opacity": (final_prune_min_opacity, 0.05),
+              "final_prune_score_thresh": (final_prune_score_thresh, 0.95),
+              "densify_metric_gate": (densify_metric_gate, 5.0)}
+    _moved = {k: v for k, (v, d) in _dials.items() if v != d}
+    if _moved:
+        stats["solidity_dials"] = _moved
     try:
         stats_path = os.path.join(dataset.model_path, "train_stats.json")
         with open(stats_path, "w") as f:
