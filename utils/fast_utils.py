@@ -155,6 +155,150 @@ def attribute_gaussians_by_class(camlist, gaussians, pipe, bg, args, groups):
     return attr, r_bar
 
 
+def local_plane_normals(pts, k=16, chunk=2048):
+    """Per-point local PCA normal (unit, arbitrary sign) from k nearest neighbors.
+
+    pts: (M, 3) float tensor. Returns (M, 3) float32 normals on pts.device.
+    Chunked pairwise distances keep memory at chunk x M. Used to score the
+    billboard statistic |a3 . n_local| for label-attributed gaussians: a healthy
+    text/paper gaussian lies flat (shortest axis ~ local surface normal); a
+    billboard faces its observers instead (plan section 12 / owner observation).
+    """
+    m = pts.shape[0]
+    if m <= k:
+        raise ValueError("local_plane_normals needs more than k={} points, got {}".format(k, m))
+    pts = pts.float()
+    normals = torch.empty((m, 3), dtype=torch.float32, device=pts.device)
+    for s in range(0, m, chunk):
+        e = min(s + chunk, m)
+        d2 = torch.cdist(pts[s:e], pts)              # (c, M)
+        idx = d2.topk(k + 1, largest=False).indices  # includes self
+        nb = pts[idx]                                # (c, k+1, 3)
+        nb = nb - nb.mean(dim=1, keepdim=True)
+        cov = nb.transpose(1, 2) @ nb                # (c, 3, 3)
+        # smallest-eigenvector = local normal; eigh is ascending
+        evecs = torch.linalg.eigh(cov).eigenvectors
+        normals[s:e] = evecs[:, :, 0]
+    return normals
+
+
+@torch.no_grad()  # read-only diagnostics: never retain graph across the render loop
+def observability_telemetry(camlist, gaussians, pipe, bg, args, label_class_id,
+                            min_px=16, per_class=False, num_classes=5):
+    """A1 observability + billboard telemetry (READ-ONLY: no loss, no state).
+
+    Per camera with a class map: binary stencil renders give per-gaussian counts.
+    In heartbeat mode (per_class=False): 2 renders (label stencil + remainder).
+    In dump mode (per_class=True): one render per class id in [0, num_classes)
+    (the ids partition the map, so no remainder render is needed).
+
+    Accumulates, with BINARY per-(gaussian, camera) support weights
+    w = 1[label_count >= min_px] (raw pixel counts are footprint-dependent --
+    the current geometry would otherwise feed back into its own observability
+    statistic; independent-evaluation corrections #3/#4):
+      M      = sum_w d d^T   (direction second moment; sign-invariant)
+      r_vec  = sum_w d       (first moment; |r|/w = rho, kept as a diagnostic)
+      support= sum w         (number of supporting cameras)
+    plus label/total pixel counts over ALL cameras for purity (and per-class
+    counts + margin in dump mode).
+
+    Derived per gaussian (axes from build_rotation at the sorted-scale order):
+      c1 = a1^T M_hat a1, c2 = a2^T M_hat a2,
+      h  = sqrt(max(c1 - c2, 0))   -- preferential hiddenness of the long axis
+      billboard = |a3 . n_local|   -- n_local from local_plane_normals over the
+                  high-purity label pool; NaN where undefined.
+
+    Returns a dict of per-gaussian tensors (all on the model device):
+      counts (N, C float; C=2 heartbeat / num_classes dump), purity, margin
+      (dump mode only, else None), support, rho, c1, c2, h, billboard,
+      pool_mask (bool: purity >= 0.5 & support >= 1). NOTE pool_mask does NOT
+      imply a finite billboard: pools <= K_LOCAL and rows strided out by
+      POOL_CAP keep NaN — consumers must filter torch.isfinite(billboard).
+      Sentinels: h/rho/c1/c2 are 0.0 where support == 0 and purity/margin are
+      0.0 where never rendered — npz consumers must join on support/counts,
+      not on values alone.
+    """
+    from utils.general_utils import build_rotation  # deferred: avoids import cycles
+
+    device = gaussians.get_xyz.device
+    n = gaussians.get_xyz.shape[0]
+    n_cols = num_classes if per_class else 2
+    lab_col = int(label_class_id) if per_class else 0
+    counts = torch.zeros((n, n_cols), dtype=torch.float32, device=device)
+    Msum = torch.zeros((n, 3, 3), dtype=torch.float32, device=device)
+    rvec = torch.zeros((n, 3), dtype=torch.float32, device=device)
+    support = torch.zeros(n, dtype=torch.float32, device=device)
+    for cam in camlist:
+        class_map = getattr(cam, "roi_class_map", None)
+        if class_map is None:
+            continue
+        cm = class_map.to(device)
+        cam_lab = None
+        if per_class:
+            for cid in range(num_classes):
+                stencil = cm == cid
+                if not bool(stencil.any()):
+                    continue
+                cc = _stencil_counts(cam, gaussians, pipe, bg, args, stencil).float()
+                counts[:, cid] += cc
+                if cid == lab_col:
+                    cam_lab = cc
+        else:
+            stencil = cm == int(label_class_id)
+            if bool(stencil.any()):
+                cam_lab = _stencil_counts(cam, gaussians, pipe, bg, args, stencil).float()
+                counts[:, 0] += cam_lab
+            rem = ~stencil
+            if bool(rem.any()):
+                counts[:, 1] += _stencil_counts(cam, gaussians, pipe, bg, args, rem).float()
+        if cam_lab is None:
+            continue
+        w = (cam_lab >= float(min_px)).float()
+        if not bool(w.any()):
+            continue
+        cam_center = cam.camera_center.to(device).float().reshape(1, 3)
+        d = cam_center - gaussians.get_xyz.detach()
+        d = d / d.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        Msum += w[:, None, None] * (d[:, :, None] * d[:, None, :])
+        rvec += w[:, None] * d
+        support += w
+    tot = counts.sum(dim=1)
+    purity = counts[:, lab_col] / tot.clamp_min(1.0)
+    margin = None
+    if per_class:
+        others = counts.clone()
+        others[:, lab_col] = -1.0
+        margin = (counts[:, lab_col] - others.max(dim=1).values) / tot.clamp_min(1.0)
+    ws = support.clamp_min(1.0)
+    Mhat = Msum / ws[:, None, None]
+    rho = (rvec / ws[:, None]).norm(dim=1)
+    with torch.no_grad():
+        order = torch.argsort(gaussians._scaling.detach(), dim=1, descending=True)
+        R = build_rotation(gaussians._rotation.detach())
+        ar = torch.arange(n, device=device)
+        a1 = R[ar, :, order[:, 0]]
+        a2 = R[ar, :, order[:, 1]]
+        a3 = R[ar, :, order[:, 2]]
+    c1 = torch.einsum("ni,nij,nj->n", a1, Mhat, a1)
+    c2 = torch.einsum("ni,nij,nj->n", a2, Mhat, a2)
+    h = torch.sqrt(torch.clamp(c1 - c2, min=0.0))
+    billboard = torch.full((n,), float("nan"), dtype=torch.float32, device=device)
+    pool = (purity >= 0.5) & (support >= 1.0)
+    K_LOCAL = 16       # kNN size for local normals (local_plane_normals needs > K points)
+    POOL_CAP = 60000   # cdist is O(chunk x pool): cap the kNN cloud so a bg-heavy
+    #                    pool cannot balloon memory (review finding); deterministic
+    #                    stride subsample, remaining pool rows keep NaN billboard.
+    pool_idx = torch.nonzero(pool, as_tuple=True)[0]
+    if pool_idx.numel() > K_LOCAL:
+        if pool_idx.numel() > POOL_CAP:
+            step = (pool_idx.numel() + POOL_CAP - 1) // POOL_CAP
+            pool_idx = pool_idx[::step]
+        nrm = local_plane_normals(gaussians.get_xyz.detach()[pool_idx], k=K_LOCAL)
+        billboard[pool_idx] = (a3[pool_idx] * nrm).sum(dim=1).abs()
+    return dict(counts=counts, purity=purity, margin=margin, support=support,
+                rho=rho, c1=c1, c2=c2, h=h, billboard=billboard, pool_mask=pool)
+
+
 def _class_weighted_counts(cam, gaussians, pipe, bg, args, dmap, groups):
     """Per-gaussian densify counts with per-class weights (float result).
 

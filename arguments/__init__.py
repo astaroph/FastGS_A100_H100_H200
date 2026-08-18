@@ -80,6 +80,11 @@ class ModelParams(ParamGroup):
         # spec, e.g. "2:0.01,0:0.01". "" = off. Lives in ModelParams because the
         # camera load must keep the per-camera class maps when it is set.
         self.roi_scale_reg = ""
+        # A1 observability + billboard telemetry (FASTGS_ROI_OBS_TELEMETRY):
+        # READ-ONLY diagnostics (no loss change) — periodic [ROI-OBS] heartbeat +
+        # a final per-gaussian obs_telemetry.npz beside train_stats.json. Lives in
+        # ModelParams because the camera load must keep the class maps when set.
+        self.roi_obs_telemetry = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

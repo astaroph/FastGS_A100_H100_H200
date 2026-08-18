@@ -36,7 +36,7 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 from utils.fast_utils import (compute_gaussian_score_fastgs, sampling_cameras,
-                              attribute_gaussians_by_class)
+                              attribute_gaussians_by_class, observability_telemetry)
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets):
@@ -157,6 +157,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "[ROI-SCALE-REG] requires optimizer_type 'default': sparse_adam steps "
                 "only the current view's visible gaussians, silently dropping the "
                 "regularizer's off-view _scaling gradients.")
+    # --- A1 observability/billboard telemetry (FASTGS_ROI_OBS_TELEMETRY): READ-ONLY
+    # diagnostics for the r4 calibration; never touches the loss or the model. ---
+    roi_obs_telemetry = bool(getattr(dataset, "roi_obs_telemetry", False))
+    if roi_obs_telemetry and not roi_enabled:
+        raise RuntimeError(
+            "[ROI-OBS] --roi_obs_telemetry requires --use_roi_masks "
+            "(class maps come from the ROI mask products).")
+    if roi_obs_telemetry:
+        _obs_lbl = int(getattr(dataset, "roi_label_class_id", 2))
+        if not (0 <= _obs_lbl < 5):  # 5-class LightSeg maps; dump indexes column _obs_lbl
+            raise RuntimeError(
+                "[ROI-OBS] --roi_label_class_id {} out of range [0, 4]".format(_obs_lbl))
     if roi_enabled:
         if opt.roi_norm not in ("roi", "global"):
             raise RuntimeError(
@@ -254,6 +266,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print("[ROI-SCALE-REG] enabled | groups {} | r0 {} | class maps {}/{} views".format(
                 [(l, ids) for l, ids in scale_reg_groups], scale_reg_r0, n_cm,
                 len(train_cams)))
+        if roi_obs_telemetry:
+            n_cm = sum(1 for cam in train_cams
+                       if getattr(cam, "roi_class_map", None) is not None)
+            n_masked = len(train_cams) - roi_failopen_count
+            if n_masked <= 0 or n_cm < n_masked:
+                raise RuntimeError(
+                    "[ROI-OBS] {}/{} masked training views carry a class map "
+                    "(zero masked views = broken mask export); --roi_obs_telemetry "
+                    "needs class maps on every masked view.".format(n_cm, n_masked))
+            print("[ROI-OBS] enabled | label class {} | class maps {}/{} views | "
+                  "READ-ONLY telemetry (no loss change)".format(
+                      int(getattr(dataset, "roi_label_class_id", 2)), n_cm, len(train_cams)))
         max_frac = float(getattr(dataset, "roi_max_failopen_frac", 0.10))
         if len(train_cams) > 0 and roi_failopen_count / len(train_cams) > max_frac:
             raise RuntimeError(
@@ -317,6 +341,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scale_reg_rbar = None
     scale_reg_refresh_i = 0
     stats_scale_reg_events = []
+    # A1 telemetry heartbeat state (READ-ONLY; every 10th densify event)
+    obs_event_i = 0
+    stats_obs_events = []
 
     for iteration in range(first_iter, opt.iterations + 1):
 
@@ -509,6 +536,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 {"iter": iteration, "attributed": counts, "rho_median": rho_med,
                                  "ratio_log_mean": rr_mean, "ratio_log_p95": rr_p95})
 
+                    # A1 telemetry heartbeat: cheap 2-render/cam probe every 10th
+                    # densify event; read-only, after all mutators (row-aligned).
+                    if roi_obs_telemetry:
+                        obs_event_i += 1
+                        if obs_event_i % 10 == 1:
+                            # Fail-soft (review finding): a read-only diagnostic
+                            # must never kill a training run — same discipline as
+                            # the final dump.
+                            try:
+                                tel = observability_telemetry(
+                                    camlist, gaussians, pipe, bg, opt,
+                                    int(getattr(dataset, "roi_label_class_id", 2)))
+                                pool = tel["pool_mask"]
+                                n_pool = int(pool.sum().item())
+                                bb = tel["billboard"][pool]
+                                bb = bb[torch.isfinite(bb)]
+                                if n_pool:
+                                    # billboard gates separately: it is NaN for
+                                    # pools <= K_LOCAL even when h/purity are fine
+                                    bb_frac = (float((bb < 0.5).float().mean().item())
+                                               if bb.numel() else -1.0)
+                                    h_med = float(tel["h"][pool].median().item())
+                                    h_p95 = float(torch.quantile(tel["h"][pool], 0.95).item())
+                                    sup_med = float(tel["support"][pool].median().item())
+                                    pur_med = float(tel["purity"][pool].median().item())
+                                else:
+                                    bb_frac = h_med = h_p95 = sup_med = pur_med = -1.0
+                                print("[ROI-OBS] iter {} pool {} | purity med {:.2f} | "
+                                      "support med {:.1f} | h med {:.3f} p95 {:.3f} | "
+                                      "billboard frac {:.3f}".format(
+                                          iteration, n_pool, pur_med, sup_med, h_med,
+                                          h_p95, bb_frac))
+                                stats_obs_events.append({
+                                    "iter": iteration, "pool": n_pool,
+                                    "purity_med": pur_med, "support_med": sup_med,
+                                    "h_med": h_med, "h_p95": h_p95,
+                                    "billboard_frac_lt05": bb_frac})
+                            except Exception as e:
+                                print("[ROI-OBS] WARNING: heartbeat failed at iter {}: {}".format(
+                                    iteration, e))
+
                     flagged_mean = roi_cfg.last_flagged_px_mean if roi_cfg is not None else None
                     stats_densify_events.append({
                         "iter": iteration,
@@ -662,6 +730,41 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "refreshes": scale_reg_refresh_i,
             "events": stats_scale_reg_events,
         }
+    if roi_obs_telemetry:
+        # Final per-gaussian dump over ALL masked cameras with full per-class
+        # counts (classes partition the map, so purity AND margin are exact).
+        # Fail-soft: end-of-run diagnostics must never kill a finished train.
+        stats["obs_telemetry"] = {"npz": None, "cams": 0, "events": stats_obs_events}
+        try:
+            dump_cams = [c for c in scene.getTrainCameras()
+                         if getattr(c, "roi_class_map", None) is not None]
+            tel = observability_telemetry(
+                dump_cams, gaussians, pipe, bg, opt,
+                int(getattr(dataset, "roi_label_class_id", 2)), per_class=True)
+            arrs = dict(
+                xyz=gaussians.get_xyz.detach().cpu().numpy().astype(np.float32),
+                scales_log=gaussians._scaling.detach().cpu().numpy().astype(np.float32),
+                opacity_logit=gaussians._opacity.detach().reshape(-1).cpu().numpy().astype(np.float32),
+                counts=tel["counts"].cpu().numpy().astype(np.float32),
+                purity=tel["purity"].cpu().numpy().astype(np.float32),
+                margin=tel["margin"].cpu().numpy().astype(np.float32),
+                support=tel["support"].cpu().numpy().astype(np.float32),
+                rho=tel["rho"].cpu().numpy().astype(np.float32),
+                c1=tel["c1"].cpu().numpy().astype(np.float32),
+                c2=tel["c2"].cpu().numpy().astype(np.float32),
+                h=tel["h"].cpu().numpy().astype(np.float32),
+                billboard=tel["billboard"].cpu().numpy().astype(np.float32),
+                pool_mask=tel["pool_mask"].cpu().numpy(),
+            )
+            npz_path = os.path.join(dataset.model_path, "obs_telemetry.npz")
+            tmp_path = os.path.join(dataset.model_path, "obs_telemetry_tmp.npz")
+            np.savez_compressed(tmp_path, **arrs)
+            os.replace(tmp_path, npz_path)  # atomic: no truncated npz on preemption
+            stats["obs_telemetry"].update(npz="obs_telemetry.npz", cams=len(dump_cams))
+            print("[ROI-OBS] telemetry dump written to {} ({} cams)".format(
+                npz_path, len(dump_cams)))
+        except Exception as e:
+            print("[ROI-OBS] WARNING: telemetry dump failed: {}".format(e))
     try:
         stats_path = os.path.join(dataset.model_path, "train_stats.json")
         with open(stats_path, "w") as f:
