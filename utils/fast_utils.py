@@ -76,6 +76,85 @@ def normalize(config_value, value_tensor):
     return ret_value
 
 
+def _stencil_counts(cam, gaussians, pipe, bg, args, stencil):
+    """One binary get_flag render: per-gaussian int32 counts of stencil pixels
+    the gaussian actually blends into (occlusion-aware). The CUDA kernel counts
+    metric_map[pix] == 1 EXACTLY, so the stencil must be binary (bool/0-1)."""
+    return render_fastgs(
+        cam, gaussians, pipe, bg, args.mult,
+        get_flag=True, metric_map=stencil.int(),
+    )["accum_metric_counts"]
+
+
+def attribute_gaussians_by_class(camlist, gaussians, pipe, bg, args, groups):
+    """Per-gaussian lambda-group attribution + observed-direction resultant.
+
+    For each sampled camera that carries a class map: one full-frame binary
+    render per lambda group (union stencil of the group's class ids) plus one
+    remainder render (every other pixel -- required so a silhouette-edge
+    gaussian overhanging a regularized class is not mis-attributed to it).
+    Counts are occlusion-aware via the get_flag path.
+
+    attr[i] = index into ``groups`` when that group's total count strictly
+    exceeds every other column (remainder included); -1 otherwise (tie,
+    remainder win, or never rendered by the sampled cameras -- all
+    conservative: no regularization).
+
+    r_bar[i] = count-weighted mean unit direction gaussian -> camera over ALL
+    columns' counts, deliberately NOT renormalized: its norm rho <= 1 encodes
+    sweep diversity, so well-swept gaussians self-attenuate the scale-reg
+    penalty (train.py multiplies the hinge threshold by |a1 . r_bar|). Rows
+    with attr == -1 carry no meaning in r_bar.
+
+    Fail-open cameras (roi_class_map is None) are skipped; train.py's coverage
+    check bounds how many of those can exist.
+
+    Returns (attr int8 (N,), r_bar float32 (N, 3)) on the model's device.
+    """
+    device = gaussians.get_xyz.device
+    n = gaussians.get_xyz.shape[0]
+    if len(groups) > 126:
+        # attr is int8 with -1 as the unattributed sentinel; a wider group list
+        # would wrap silently. Unreachable with real specs (<= 256 class ids).
+        raise ValueError("attribute_gaussians_by_class supports at most 126 groups, "
+                         "got {}".format(len(groups)))
+    n_cols = len(groups) + 1
+    totals = torch.zeros((n, n_cols), dtype=torch.float32, device=device)
+    dir_acc = torch.zeros((n, 3), dtype=torch.float32, device=device)
+    for cam in camlist:
+        class_map = getattr(cam, "roi_class_map", None)
+        if class_map is None:
+            continue
+        cm = class_map.to(device)
+        remaining = torch.ones_like(cm, dtype=torch.bool)
+        cam_counts = torch.zeros(n, dtype=torch.float32, device=device)
+        for gi, (_lam, ids) in enumerate(groups):
+            gmask = torch.zeros_like(remaining)
+            for cid in ids:
+                gmask |= (cm == int(cid))
+            remaining &= ~gmask
+            if not bool(gmask.any()):
+                continue
+            counts = _stencil_counts(cam, gaussians, pipe, bg, args, gmask).float()
+            totals[:, gi] += counts
+            cam_counts += counts
+        if bool(remaining.any()):
+            counts = _stencil_counts(cam, gaussians, pipe, bg, args, remaining).float()
+            totals[:, -1] += counts
+            cam_counts += counts
+        cam_center = cam.camera_center.to(device).float().reshape(1, 3)
+        dirs = cam_center - gaussians.get_xyz.detach()
+        dirs = dirs / dirs.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        dir_acc += cam_counts[:, None] * dirs
+    wsum = totals.sum(dim=1)
+    r_bar = dir_acc / wsum.clamp_min(1.0)[:, None]
+    best_vals, best_idx = totals.max(dim=1)
+    ties = (totals == best_vals[:, None]).sum(dim=1) > 1
+    attr = best_idx.to(torch.int8)
+    attr[(best_idx == (n_cols - 1)) | ties | (best_vals <= 0)] = -1
+    return attr, r_bar
+
+
 def _class_weighted_counts(cam, gaussians, pipe, bg, args, dmap, groups):
     """Per-gaussian densify counts with per-class weights (float result).
 
@@ -108,17 +187,11 @@ def _class_weighted_counts(cam, gaussians, pipe, bg, args, dmap, groups):
             continue
         if not bool(sel.any()):
             continue
-        counts = render_fastgs(
-            cam, gaussians, pipe, bg, args.mult,
-            get_flag=True, metric_map=sel.int(),
-        )["accum_metric_counts"]
+        counts = _stencil_counts(cam, gaussians, pipe, bg, args, sel)
         contrib = counts.float() * float(weight)
         weighted = contrib if weighted is None else weighted + contrib
     if bool(remaining.any()):
-        counts = render_fastgs(
-            cam, gaussians, pipe, bg, args.mult,
-            get_flag=True, metric_map=remaining.int(),
-        )["accum_metric_counts"]
+        counts = _stencil_counts(cam, gaussians, pipe, bg, args, remaining)
         weighted = counts.float() if weighted is None else weighted + counts.float()
     if weighted is None:
         weighted = torch.zeros(

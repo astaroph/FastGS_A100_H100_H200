@@ -18,12 +18,12 @@ from types import SimpleNamespace
 from lpipsPyTorch import lpips
 from utils.loss_utils import l1_loss
 from utils.roi_utils import (parse_class_weights, parse_densify_class_weights,
-                             masked_l1, masked_ssim)
+                             parse_scale_reg_spec, masked_l1, masked_ssim)
 from fused_ssim import fused_ssim as fast_ssim
 from gaussian_renderer import render_fastgs, network_gui_ws
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, build_rotation
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -35,7 +35,8 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
+from utils.fast_utils import (compute_gaussian_score_fastgs, sampling_cameras,
+                              attribute_gaussians_by_class)
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets):
@@ -100,6 +101,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     densify_metric_gate = float(getattr(opt, "densify_metric_gate", 5.0))
     if not (0.0 < densify_min_opacity < 1.0):
         raise RuntimeError("--densify_min_opacity must be in (0,1), got {}".format(densify_min_opacity))
+    # v10 collapse guard (pipeline plan section 22): reset_opacity clamps ALL
+    # opacities to <= 0.01, so a per-event prune floor at or above the clamp makes
+    # the whole model prune-eligible after every reset; the budgeted prune then
+    # removes 50% of it per densify event until opacities recover (v10: 548k -> 17k
+    # in 5 events). Hard error whenever a reset falls inside the densify window.
+    if (densify_min_opacity >= 0.01
+            and int(opt.opacity_reset_interval) <= int(opt.densify_until_iter)):
+        raise RuntimeError(
+            "--densify_min_opacity {} >= 0.01, the reset_opacity clamp: every opacity "
+            "reset (interval {}) would make the whole model prune-eligible and the "
+            "budgeted prune removes 50% per densify event until recovery. Keep it "
+            "below 0.01, or move --opacity_reset_interval past --densify_until_iter "
+            "if you truly intend this.".format(
+                densify_min_opacity, int(opt.opacity_reset_interval)))
     if not (0.0 < final_prune_min_opacity < 1.0):
         raise RuntimeError("--final_prune_min_opacity must be in (0,1), got {}".format(final_prune_min_opacity))
     if not (0.0 < final_prune_score_thresh <= 1.0):
@@ -118,6 +133,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             roi_densify_cw_groups = parse_densify_class_weights(roi_densify_cw_spec)
         except ValueError as exc:
             raise RuntimeError("[ROI-DENSIFY-CW] bad --roi_densify_class_weights: {}".format(exc))
+    # --- Class-scoped scale regularization (FASTGS_ROI_SCALE_REG, scale-reg plan r2):
+    # ray-modulated anisotropy hinge on the top-2 log-scales of attributed gaussians.
+    scale_reg_spec = str(getattr(dataset, "roi_scale_reg", "") or "")
+    scale_reg_groups = None
+    scale_reg_r0 = float(getattr(opt, "roi_scale_reg_ratio", 4.0))
+    scale_reg_log_r0 = 0.0
+    if scale_reg_spec:
+        if not roi_enabled:
+            raise RuntimeError(
+                "[ROI-SCALE-REG] --roi_scale_reg requires --use_roi_masks "
+                "(class maps come from the ROI mask products).")
+        try:
+            scale_reg_groups = parse_scale_reg_spec(scale_reg_spec)
+        except ValueError as exc:
+            raise RuntimeError("[ROI-SCALE-REG] bad --roi_scale_reg: {}".format(exc))
+        if not (math.isfinite(scale_reg_r0) and scale_reg_r0 > 1.0):
+            raise RuntimeError(
+                "--roi_scale_reg_ratio must be finite and > 1, got {}".format(scale_reg_r0))
+        scale_reg_log_r0 = math.log(scale_reg_r0)
+        if str(getattr(opt, "optimizer_type", "default")) != "default":
+            raise RuntimeError(
+                "[ROI-SCALE-REG] requires optimizer_type 'default': sparse_adam steps "
+                "only the current view's visible gaussians, silently dropping the "
+                "regularizer's off-view _scaling gradients.")
     if roi_enabled:
         if opt.roi_norm not in ("roi", "global"):
             raise RuntimeError(
@@ -159,6 +198,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+        if scale_reg_groups is not None:
+            print("[ROI-SCALE-REG] WARNING: resuming from a checkpoint; the regularizer "
+                  "is inactive until the first densify/final-prune event after resume "
+                  "re-derives the attribution.")
 
     # --- ROI mask coverage check / banner (after Scene: needs loaded cameras) ---
     if roi_enabled:
@@ -199,6 +242,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         n_cm, n_masked))
             print("[ROI-DENSIFY-CW] enabled | groups {} | class maps {}/{} views".format(
                 [(w, ids) for w, ids in roi_densify_cw_groups], n_cm, len(train_cams)))
+        if scale_reg_groups is not None:
+            n_cm = sum(1 for cam in train_cams
+                       if getattr(cam, "roi_class_map", None) is not None)
+            n_masked = len(train_cams) - roi_failopen_count
+            if n_cm < n_masked:
+                raise RuntimeError(
+                    "[ROI-SCALE-REG] only {}/{} masked training views carry a class map; "
+                    "--roi_scale_reg should have populated all of them.".format(
+                        n_cm, n_masked))
+            print("[ROI-SCALE-REG] enabled | groups {} | r0 {} | class maps {}/{} views".format(
+                [(l, ids) for l, ids in scale_reg_groups], scale_reg_r0, n_cm,
+                len(train_cams)))
         max_frac = float(getattr(dataset, "roi_max_failopen_frac", 0.10))
         if len(train_cams) > 0 and roi_failopen_count / len(train_cams) > max_frac:
             raise RuntimeError(
@@ -255,6 +310,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     stats_densify_events = []
     stats_bg_pruned_total = 0
     roi_starvation_warned = False
+    # Scale-reg state: attribution + direction resultant are valid only for the
+    # population they were computed on; refreshed after every mutation (see the
+    # two attribute_gaussians_by_class call sites), None before the first refresh.
+    scale_reg_attr = None
+    scale_reg_rbar = None
+    scale_reg_refresh_i = 0
+    stats_scale_reg_events = []
 
     for iteration in range(first_iter, opt.iterations + 1):
 
@@ -324,6 +386,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1 = l1_loss(image, gt_image)
             ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        # Ray-modulated scale regularization (scale-reg plan r2): for attributed
+        # gaussians, hinge on ls1 - ls2 + ln|a1 . r_bar| - ln r0. Gradient reaches
+        # _scaling only; axis and direction resultant are frozen evidence. Inactive
+        # until the first attribution refresh (~first densify event).
+        if scale_reg_groups is not None and scale_reg_attr is not None:
+            n_now = gaussians.get_xyz.shape[0]
+            if scale_reg_attr.shape[0] != n_now:
+                raise RuntimeError(
+                    "[ROI-SCALE-REG] attribution tensor is stale ({} rows vs {} "
+                    "gaussians): a population mutation was not followed by a "
+                    "refresh.".format(scale_reg_attr.shape[0], n_now))
+            sub = torch.nonzero(scale_reg_attr >= 0, as_tuple=True)[0]
+            if sub.numel() > 0:
+                ls_sub = gaussians._scaling[sub]
+                top2 = torch.topk(ls_sub, 2, dim=1)
+                with torch.no_grad():
+                    rot_sub = build_rotation(gaussians._rotation[sub])
+                    # Top-1 index from the SAME topk that provides the hinge values,
+                    # so a1 always matches the axis the hinge calls "longest" (an
+                    # exact tie would otherwise let argmax and topk disagree).
+                    amax = top2.indices[:, 0]
+                    a1 = rot_sub[torch.arange(sub.numel(), device=sub.device), :, amax]
+                    align = (a1 * scale_reg_rbar[sub]).sum(dim=1).abs().clamp_min(1e-3)
+                pen = torch.relu(top2.values[:, 0] - top2.values[:, 1]
+                                 + torch.log(align) - scale_reg_log_r0)
+                attr_sub = scale_reg_attr[sub]
+                for gi, (lam, _ids) in enumerate(scale_reg_groups):
+                    gsel = attr_sub == gi
+                    if bool(gsel.any()):
+                        loss = loss + float(lam) * pen[gsel].mean()
         loss.backward()
 
         iter_end.record()
@@ -392,6 +484,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             stats_bg_pruned_total += pruned_bg
                             print(f"[ITER {iteration}] ROI background prune: removed {pruned_bg}")
 
+                    # Scale-reg attribution refresh: MUST follow the last population
+                    # mutation in this block (densify_and_prune + bg-rounds prune
+                    # above); the cached tensors are row-aligned until the next one.
+                    if scale_reg_groups is not None:
+                        scale_reg_attr, scale_reg_rbar = attribute_gaussians_by_class(
+                            camlist, gaussians, pipe, bg, opt, scale_reg_groups)
+                        scale_reg_refresh_i += 1
+                        if scale_reg_refresh_i % 10 == 1:
+                            valid = scale_reg_attr >= 0
+                            counts = [int((scale_reg_attr == gi).sum().item())
+                                      for gi in range(len(scale_reg_groups))]
+                            if bool(valid.any()):
+                                rho_med = float(scale_reg_rbar[valid].norm(dim=1).median().item())
+                                t2 = torch.topk(gaussians._scaling[valid].detach(), 2, dim=1).values
+                                rr = t2[:, 0] - t2[:, 1]
+                                rr_mean, rr_p95 = float(rr.mean().item()), float(torch.quantile(rr, 0.95).item())
+                            else:
+                                rho_med, rr_mean, rr_p95 = -1.0, -1.0, -1.0
+                            print("[ROI-SCALE-REG] iter {} refresh {}: attributed {} | rho med "
+                                  "{:.3f} | ratio_log mean {:.3f} p95 {:.3f}".format(
+                                      iteration, scale_reg_refresh_i, counts, rho_med, rr_mean, rr_p95))
+                            stats_scale_reg_events.append(
+                                {"iter": iteration, "attributed": counts, "rho_median": rho_med,
+                                 "ratio_log_mean": rr_mean, "ratio_log_p95": rr_p95})
+
                     flagged_mean = roi_cfg.last_flagged_px_mean if roi_cfg is not None else None
                     stats_densify_events.append({
                         "iter": iteration,
@@ -453,6 +570,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if pruned_bg:
                         stats_bg_pruned_total += pruned_bg
                         print(f"[ITER {iteration}] ROI background prune: removed {pruned_bg}")
+
+                # Scale-reg attribution refresh: follows final_prune + bg-rounds
+                # prune, the last mutators in this block (same invariant as the
+                # densify-block refresh above).
+                if scale_reg_groups is not None:
+                    scale_reg_attr, scale_reg_rbar = attribute_gaussians_by_class(
+                        camlist, gaussians, pipe, bg, opt, scale_reg_groups)
+                    scale_reg_refresh_i += 1
         
             # Optimization step
             if iteration < opt.iterations:
@@ -529,6 +654,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     _moved = {k: v for k, (v, d) in _dials.items() if v != d}
     if _moved:
         stats["solidity_dials"] = _moved
+    if scale_reg_groups is not None:
+        stats["scale_reg"] = {
+            "spec": scale_reg_spec,
+            "r0": scale_reg_r0,
+            "groups": [[lam, ids] for lam, ids in scale_reg_groups],
+            "refreshes": scale_reg_refresh_i,
+            "events": stats_scale_reg_events,
+        }
     try:
         stats_path = os.path.join(dataset.model_path, "train_stats.json")
         with open(stats_path, "w") as f:

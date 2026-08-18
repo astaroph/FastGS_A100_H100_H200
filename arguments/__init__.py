@@ -76,6 +76,10 @@ class ModelParams(ParamGroup):
         # (e.g. "2:2.0,3:2.0,1:0.5"). "" = off. Lives in ModelParams because scene
         # load must keep the per-camera class maps when it is set.
         self.roi_densify_class_weights = ""
+        # Class-scoped scale regularization (FASTGS_ROI_SCALE_REG): "id:lambda"
+        # spec, e.g. "2:0.01,0:0.01". "" = off. Lives in ModelParams because the
+        # camera load must keep the per-camera class maps when it is set.
+        self.roi_scale_reg = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -149,6 +153,10 @@ class OptimizationParams(ParamGroup):
         self.final_prune_min_opacity = 0.05
         self.final_prune_score_thresh = 0.95
         self.densify_metric_gate = 5.0
+        # Scale-reg free-anisotropy allowance r0 (a ratio, not a log): the
+        # ray-modulated hinge fires only when (s1/s2) * |a1.r_bar| exceeds it.
+        # Only read when --roi_scale_reg is set.
+        self.roi_scale_reg_ratio = 4.0
         self.score_num_cameras = 10
         self.final_prune_interval = 3000
         self.final_prune_until_iter = 30000

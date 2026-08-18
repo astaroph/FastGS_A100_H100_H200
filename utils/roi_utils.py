@@ -73,6 +73,76 @@ def parse_class_weights(spec):
     return lut
 
 
+def parse_scale_reg_spec(spec):
+    """Parse a comma-separated "id:lambda" spec into scale-reg lambda groups.
+
+    spec: e.g. "2:0.01,0:0.01" -- class ids as in the mask PNGs; lambda is the
+    per-class loss weight of the ray-modulated anisotropy hinge (train.py).
+    Unlike parse_densify_class_weights, lambda 1.0 is meaningful and KEPT;
+    entries with lambda exactly 0.0 are dropped (an explicitly disabled class).
+
+    Returns: list of (lam, [class_ids]) groups -- ids sharing a lambda are
+    grouped so attribution renders one union stencil per distinct lambda, not
+    one per class. Group order is deterministic (first appearance of each
+    lambda).
+
+    Raises ValueError on: empty spec / no valid entries, malformed pairs,
+    non-integer or out-of-range [0,255] ids, duplicate ids, non-finite or
+    negative lambdas, or a spec whose every entry is 0.0 (a fully-disabled
+    spec is a config mistake, not a feature).
+    """
+    if spec is None or not str(spec).strip():
+        raise ValueError("scale-reg spec is empty: {!r}".format(spec))
+
+    seen_ids = set()
+    groups = []          # list of (lam, [ids]) in first-appearance order
+    by_lam = {}
+    n_valid = 0
+    for raw_pair in str(spec).split(","):
+        pair = raw_pair.strip()
+        if not pair:
+            continue
+        parts = pair.split(":")
+        if len(parts) != 2:
+            raise ValueError(
+                "malformed scale-reg pair {!r} in spec {!r} (expected 'id:lambda')".format(pair, spec))
+        try:
+            class_id = int(parts[0].strip())
+        except ValueError:
+            raise ValueError("class id {!r} in pair {!r} is not an integer".format(parts[0], pair))
+        try:
+            lam = float(parts[1].strip())
+        except ValueError:
+            raise ValueError("lambda {!r} in pair {!r} is not a float".format(parts[1], pair))
+        if not (0 <= class_id <= 255):
+            raise ValueError("class id {} in pair {!r} is out of range [0, 255]".format(class_id, pair))
+        if class_id in seen_ids:
+            raise ValueError("duplicate class id {} in spec {!r}".format(class_id, spec))
+        if not math.isfinite(lam) or lam < 0.0:
+            raise ValueError("lambda {} for class id {} must be finite and >= 0".format(lam, class_id))
+        seen_ids.add(class_id)
+        n_valid += 1
+        if lam == 0.0:
+            continue
+        if lam in by_lam:
+            by_lam[lam].append(class_id)
+        else:
+            by_lam[lam] = [class_id]
+            groups.append((lam, by_lam[lam]))
+    if n_valid == 0:
+        raise ValueError("scale-reg spec {!r} has no valid entries".format(spec))
+    if not groups:
+        raise ValueError(
+            "scale-reg spec {!r} is fully disabled (every lambda is 0.0); omit the "
+            "flag instead".format(spec))
+    if len(groups) > 126:
+        # attribution stores the group index in int8 with -1 as the sentinel;
+        # reject at parse time so misconfiguration fails before Scene load.
+        raise ValueError(
+            "scale-reg spec has {} distinct lambdas; at most 126 are supported".format(len(groups)))
+    return [(lam, ids) for lam, ids in groups]
+
+
 def parse_densify_class_weights(spec):
     """Parse a comma-separated "id:weight" spec into densify weight groups.
 

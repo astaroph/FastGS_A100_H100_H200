@@ -611,6 +611,11 @@ class GaussianModel:
         """
         Final-stage pruning with collapse protection.
         Never allows the full model to be pruned away.
+
+        Direction note: prunes gaussians whose min-max-normalized footprint score
+        is GREATER THAN score_thresh (plus any below min_opacity) -- so a HIGHER
+        threshold is gentler (label profile default 0.95); lowering it prunes
+        more, not less (v10 post-mortem, pipeline plan section 22).
         """
         n = self.get_xyz.shape[0]
         if n == 0:
