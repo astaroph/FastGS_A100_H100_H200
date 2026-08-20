@@ -227,11 +227,13 @@ def loadCam(args, id, cam_info, resolution_scale):
         want_label_bin = bool(getattr(args, "roi_keep_label_bin", False))
         if want_label_bin and label_class_id < 0:
             label_class_id = int(getattr(args, "roi_label_class_id", 2))
-        # Class-scoped densify weighting / scale regularization: keep the raw class
-        # map on the camera so the densify pass (and the scale-reg attribution pass)
-        # can partition pixels by class. Both flags "" = off, zero cost.
+        # Class-scoped densify weighting / scale regularization (v1 and v2) /
+        # telemetry: keep the raw class map on the camera so the densify pass and
+        # the attribution/observability passes can partition pixels by class.
+        # All flags "" / False = off, zero cost.
         want_class_map = (bool(str(getattr(args, "roi_densify_class_weights", "") or ""))
                           or bool(str(getattr(args, "roi_scale_reg", "") or ""))
+                          or bool(str(getattr(args, "roi_scale_reg_v2", "") or ""))
                           or bool(getattr(args, "roi_obs_telemetry", False)))
         weight_map, roi_bin, label_bin, class_map, failopen = load_roi_products(
             cam_info.mask_path, cam_info.image.size, resolution, args.roi_dilate_px, lut,

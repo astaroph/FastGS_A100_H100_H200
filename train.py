@@ -36,7 +36,8 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 from utils.fast_utils import (compute_gaussian_score_fastgs, sampling_cameras,
-                              attribute_gaussians_by_class, observability_telemetry)
+                              attribute_gaussians_by_class, observability_telemetry,
+                              scale_reg_v2_penalty)
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets):
@@ -157,6 +158,60 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "[ROI-SCALE-REG] requires optimizer_type 'default': sparse_adam steps "
                 "only the current view's visible gaussians, silently dropping the "
                 "regularizer's off-view _scaling gradients.")
+    # --- r4 scale regularization v2 (FASTGS_ROI_SCALE_REG_V2, plan §11.5/§16/§17):
+    # preferential-hiddenness hinge + optional plate term, label-only. ---
+    scale_reg_v2_spec = str(getattr(dataset, "roi_scale_reg_v2", "") or "")
+    scale_reg_v2_on = bool(scale_reg_v2_spec)
+    scale_reg_v2_lam = 0.0
+    scale_reg_v2_log_r0 = 0.0
+    scale_reg_v2_plate_lam = float(getattr(opt, "roi_scale_reg_v2_plate_lambda", 0.0))
+    scale_reg_v2_log_rp0 = 0.0
+    scale_reg_v2_class = -1
+    if scale_reg_v2_on:
+        if scale_reg_spec:
+            raise RuntimeError(
+                "[ROI-SCALE-REG-V2] --roi_scale_reg_v2 and --roi_scale_reg are mutually "
+                "exclusive: two scale regularizers stacking on the same _scaling rows is "
+                "never an intended configuration.")
+        if not roi_enabled:
+            raise RuntimeError(
+                "[ROI-SCALE-REG-V2] --roi_scale_reg_v2 requires --use_roi_masks "
+                "(class maps come from the ROI mask products).")
+        try:
+            _v2_groups = parse_scale_reg_spec(scale_reg_v2_spec)
+        except ValueError as exc:
+            raise RuntimeError("[ROI-SCALE-REG-V2] bad --roi_scale_reg_v2: {}".format(exc))
+        _v2_lbl = int(getattr(dataset, "roi_label_class_id", 2))
+        if not (0 <= _v2_lbl < 5):  # 5-class LightSeg maps
+            raise RuntimeError(
+                "[ROI-SCALE-REG-V2] --roi_label_class_id {} out of range [0, 4]".format(_v2_lbl))
+        if (len(_v2_groups) != 1 or len(_v2_groups[0][1]) != 1
+                or int(_v2_groups[0][1][0]) != _v2_lbl):
+            raise RuntimeError(
+                "[ROI-SCALE-REG-V2] v2 is label-only BY DESIGN (plan §11 correction #2: "
+                "union grouping diluted label gradients 3-7x in v13); expected exactly "
+                "\"{}:<lambda>\", got {!r}.".format(_v2_lbl, scale_reg_v2_spec))
+        scale_reg_v2_lam = float(_v2_groups[0][0])
+        scale_reg_v2_class = _v2_lbl
+        _v2_r0 = float(getattr(opt, "roi_scale_reg_v2_ratio", 4.0))
+        if not (math.isfinite(_v2_r0) and _v2_r0 > 1.0):
+            raise RuntimeError(
+                "--roi_scale_reg_v2_ratio must be finite and > 1, got {}".format(_v2_r0))
+        scale_reg_v2_log_r0 = math.log(_v2_r0)
+        if not (math.isfinite(scale_reg_v2_plate_lam) and scale_reg_v2_plate_lam >= 0.0):
+            raise RuntimeError(
+                "--roi_scale_reg_v2_plate_lambda must be finite and >= 0, got {}".format(
+                    scale_reg_v2_plate_lam))
+        _v2_rp0 = float(getattr(opt, "roi_scale_reg_v2_plate_ratio", 150.0))
+        if not (math.isfinite(_v2_rp0) and _v2_rp0 > 1.0):
+            raise RuntimeError(
+                "--roi_scale_reg_v2_plate_ratio must be finite and > 1, got {}".format(_v2_rp0))
+        scale_reg_v2_log_rp0 = math.log(_v2_rp0)
+        if str(getattr(opt, "optimizer_type", "default")) != "default":
+            raise RuntimeError(
+                "[ROI-SCALE-REG-V2] requires optimizer_type 'default': sparse_adam steps "
+                "only the current view's visible gaussians, silently dropping the "
+                "regularizer's off-view _scaling gradients.")
     # --- A1 observability/billboard telemetry (FASTGS_ROI_OBS_TELEMETRY): READ-ONLY
     # diagnostics for the r4 calibration; never touches the loss or the model. ---
     roi_obs_telemetry = bool(getattr(dataset, "roi_obs_telemetry", False))
@@ -214,6 +269,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print("[ROI-SCALE-REG] WARNING: resuming from a checkpoint; the regularizer "
                   "is inactive until the first densify/final-prune event after resume "
                   "re-derives the attribution.")
+        if scale_reg_v2_on:
+            print("[ROI-SCALE-REG-V2] WARNING: resuming from a checkpoint; the regularizer "
+                  "is inactive until the first densify/final-prune event after resume "
+                  "re-derives the observability cache.")
 
     # --- ROI mask coverage check / banner (after Scene: needs loaded cameras) ---
     if roi_enabled:
@@ -266,6 +325,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print("[ROI-SCALE-REG] enabled | groups {} | r0 {} | class maps {}/{} views".format(
                 [(l, ids) for l, ids in scale_reg_groups], scale_reg_r0, n_cm,
                 len(train_cams)))
+        if scale_reg_v2_on:
+            n_cm = sum(1 for cam in train_cams
+                       if getattr(cam, "roi_class_map", None) is not None)
+            n_masked = len(train_cams) - roi_failopen_count
+            if n_masked <= 0 or n_cm < n_masked:
+                raise RuntimeError(
+                    "[ROI-SCALE-REG-V2] {}/{} masked training views carry a class map "
+                    "(zero masked views = broken mask export); --roi_scale_reg_v2 needs "
+                    "class maps on every masked view.".format(n_cm, n_masked))
+            print("[ROI-SCALE-REG-V2] enabled | label class {} lambda {} | r0 {} | plate "
+                  "lambda {} ratio {} | class maps {}/{} views".format(
+                      scale_reg_v2_class, scale_reg_v2_lam, math.exp(scale_reg_v2_log_r0),
+                      scale_reg_v2_plate_lam, math.exp(scale_reg_v2_log_rp0),
+                      n_cm, len(train_cams)))
         if roi_obs_telemetry:
             n_cm = sum(1 for cam in train_cams
                        if getattr(cam, "roi_class_map", None) is not None)
@@ -341,6 +414,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scale_reg_rbar = None
     scale_reg_refresh_i = 0
     stats_scale_reg_events = []
+    scale_reg_v2_h = None
+    scale_reg_v2_elig1 = None
+    scale_reg_v2_elig2 = None
+    scale_reg_v2_refresh_i = 0
+    stats_scale_reg_v2_events = []
     # A1 telemetry heartbeat state (READ-ONLY; every 10th densify event)
     obs_event_i = 0
     stats_obs_events = []
@@ -443,6 +521,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gsel = attr_sub == gi
                     if bool(gsel.any()):
                         loss = loss + float(lam) * pen[gsel].mean()
+        # r4 scale reg v2 (plan §11.5/§17): preferential-hiddenness hinge (+ plate
+        # term when armed) over the refresh-cached eligibility. Gradients reach
+        # _scaling only; h and eligibility are frozen evidence between refreshes.
+        # Inactive until the first observability refresh (~first densify event).
+        # Row-alignment note: reset_opacity is population-size-NEUTRAL
+        # (replace_tensor_to_optimizer preserves rows), so only the densify and
+        # final-prune blocks can invalidate this cache — both refresh it.
+        if scale_reg_v2_on and scale_reg_v2_h is not None:
+            n_now = gaussians.get_xyz.shape[0]
+            if scale_reg_v2_h.shape[0] != n_now:
+                raise RuntimeError(
+                    "[ROI-SCALE-REG-V2] observability cache is stale ({} rows vs {} "
+                    "gaussians): a population mutation was not followed by a "
+                    "refresh.".format(scale_reg_v2_h.shape[0], n_now))
+            v2 = scale_reg_v2_penalty(
+                gaussians._scaling, scale_reg_v2_h, scale_reg_v2_elig1,
+                scale_reg_v2_elig2, scale_reg_v2_log_r0, scale_reg_v2_log_rp0)
+            loss = loss + scale_reg_v2_lam * v2["term1"]
+            if scale_reg_v2_plate_lam > 0.0:
+                loss = loss + scale_reg_v2_plate_lam * v2["term2"]
         loss.backward()
 
         iter_end.record()
@@ -535,6 +633,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             stats_scale_reg_events.append(
                                 {"iter": iteration, "attributed": counts, "rho_median": rho_med,
                                  "ratio_log_mean": rr_mean, "ratio_log_p95": rr_p95})
+
+                    # v2 observability refresh: MUST follow the last population
+                    # mutation in this block (same row-alignment contract as the
+                    # v1 refresh above). Heartbeat-mode telemetry (2 stencil
+                    # renders/cam) supplies h + pool; the billboard kNN runs only
+                    # when the plate term is armed.
+                    if scale_reg_v2_on:
+                        _t = observability_telemetry(
+                            camlist, gaussians, pipe, bg, opt, scale_reg_v2_class,
+                            with_billboard=(scale_reg_v2_plate_lam > 0.0))
+                        scale_reg_v2_h = _t["h"].detach()
+                        _pool = _t["pool_mask"] & (_t["support"] >= 2.0)
+                        scale_reg_v2_elig1 = _pool
+                        if scale_reg_v2_plate_lam > 0.0:
+                            # plate gate frozen from the §17 npz calibration:
+                            # billboard (|a3.n_local| < 0.5) & h > 0.3
+                            _bb = _t["billboard"]
+                            scale_reg_v2_elig2 = (_pool & (scale_reg_v2_h > 0.3)
+                                                  & torch.isfinite(_bb) & (_bb.abs() < 0.5))
+                        else:
+                            scale_reg_v2_elig2 = torch.zeros_like(_pool)
+                        scale_reg_v2_refresh_i += 1
+                        if scale_reg_v2_refresh_i % 10 == 1:
+                            with torch.no_grad():
+                                _p = scale_reg_v2_penalty(
+                                    gaussians._scaling.detach(), scale_reg_v2_h,
+                                    scale_reg_v2_elig1, scale_reg_v2_elig2,
+                                    scale_reg_v2_log_r0, scale_reg_v2_log_rp0,
+                                    with_stats=True)
+                                _hh = scale_reg_v2_h[scale_reg_v2_elig1]
+                                _hmed = float(_hh.median().item()) if _hh.numel() else -1.0
+                            print("[ROI-SCALE-REG-V2] iter {} refresh {}: elig {} | h med "
+                                  "{:.3f} | act1 {:.3f} pen1 {:.5f} | elig2 {} act2 {:.3f} "
+                                  "pen2 {:.5f}".format(
+                                      iteration, scale_reg_v2_refresh_i, _p["n1"], _hmed,
+                                      _p["act1"], float(_p["term1"]), _p["n2"], _p["act2"],
+                                      float(_p["term2"])))
+                            stats_scale_reg_v2_events.append(
+                                {"iter": iteration, "eligible": _p["n1"], "h_median": _hmed,
+                                 "active_frac_t1": _p["act1"], "pen_t1": float(_p["term1"]),
+                                 "eligible_t2": _p["n2"], "active_frac_t2": _p["act2"],
+                                 "pen_t2": float(_p["term2"])})
 
                     # A1 telemetry heartbeat: cheap 2-render/cam probe every 10th
                     # densify event; read-only, after all mutators (row-aligned).
@@ -646,6 +786,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     scale_reg_attr, scale_reg_rbar = attribute_gaussians_by_class(
                         camlist, gaussians, pipe, bg, opt, scale_reg_groups)
                     scale_reg_refresh_i += 1
+                if scale_reg_v2_on:
+                    _t = observability_telemetry(
+                        camlist, gaussians, pipe, bg, opt, scale_reg_v2_class,
+                        with_billboard=(scale_reg_v2_plate_lam > 0.0))
+                    scale_reg_v2_h = _t["h"].detach()
+                    _pool = _t["pool_mask"] & (_t["support"] >= 2.0)
+                    scale_reg_v2_elig1 = _pool
+                    if scale_reg_v2_plate_lam > 0.0:
+                        _bb = _t["billboard"]
+                        scale_reg_v2_elig2 = (_pool & (scale_reg_v2_h > 0.3)
+                                              & torch.isfinite(_bb) & (_bb.abs() < 0.5))
+                    else:
+                        scale_reg_v2_elig2 = torch.zeros_like(_pool)
+                    scale_reg_v2_refresh_i += 1
         
             # Optimization step
             if iteration < opt.iterations:
@@ -729,6 +883,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "groups": [[lam, ids] for lam, ids in scale_reg_groups],
             "refreshes": scale_reg_refresh_i,
             "events": stats_scale_reg_events,
+        }
+    if scale_reg_v2_on:
+        stats["scale_reg_v2"] = {
+            "spec": scale_reg_v2_spec,
+            "r0": math.exp(scale_reg_v2_log_r0),
+            "plate_lambda": scale_reg_v2_plate_lam,
+            "plate_ratio": math.exp(scale_reg_v2_log_rp0),
+            "refreshes": scale_reg_v2_refresh_i,
+            "events": stats_scale_reg_v2_events,
         }
     if roi_obs_telemetry:
         # Final per-gaussian dump over ALL masked cameras with full per-class

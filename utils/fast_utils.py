@@ -184,7 +184,8 @@ def local_plane_normals(pts, k=16, chunk=2048):
 
 @torch.no_grad()  # read-only diagnostics: never retain graph across the render loop
 def observability_telemetry(camlist, gaussians, pipe, bg, args, label_class_id,
-                            min_px=16, per_class=False, num_classes=5):
+                            min_px=16, per_class=False, num_classes=5,
+                            with_billboard=True):
     """A1 observability + billboard telemetry (READ-ONLY: no loss, no state).
 
     Per camera with a class map: binary stencil renders give per-gaussian counts.
@@ -288,8 +289,10 @@ def observability_telemetry(camlist, gaussians, pipe, bg, args, label_class_id,
     POOL_CAP = 60000   # cdist is O(chunk x pool): cap the kNN cloud so a bg-heavy
     #                    pool cannot balloon memory (review finding); deterministic
     #                    stride subsample, remaining pool rows keep NaN billboard.
+    # with_billboard=False skips the kNN pass entirely (billboard stays all-NaN):
+    # the scale-reg-v2 refresh only needs it when the plate term is armed.
     pool_idx = torch.nonzero(pool, as_tuple=True)[0]
-    if pool_idx.numel() > K_LOCAL:
+    if with_billboard and pool_idx.numel() > K_LOCAL:
         if pool_idx.numel() > POOL_CAP:
             step = (pool_idx.numel() + POOL_CAP - 1) // POOL_CAP
             pool_idx = pool_idx[::step]
@@ -297,6 +300,60 @@ def observability_telemetry(camlist, gaussians, pipe, bg, args, label_class_id,
         billboard[pool_idx] = (a3[pool_idx] * nrm).sum(dim=1).abs()
     return dict(counts=counts, purity=purity, margin=margin, support=support,
                 rho=rho, c1=c1, c2=c2, h=h, billboard=billboard, pool_mask=pool)
+
+
+def scale_reg_v2_penalty(scaling, h, elig1, elig2, log_r0, log_rp0, eps=1e-3,
+                         with_stats=False):
+    """r4 two-term scale penalty (scale-reg plan §11.5 hinge + §16/§17 plate term).
+
+    scaling: (N, 3) log-scales WITH grad (gaussians._scaling). h / elig1 / elig2
+    are detached refresh caches derived from observability_telemetry: h is the
+    preferential hiddenness of the long axis; elig1 = pool & support gate;
+    elig2 is additionally gated to billboard & high-h (all-False when the plate
+    term is off).
+
+    term1 (one-sided, §11 correction #5): relu(ls1 - sg(ls2) - (ln r0 - ln(h+eps))).
+    Gradient reaches ls1 ONLY — the long axis shrinks toward the allowance; ls2
+    is a detached target so the reg can never GROW the mid axis (the r2 flaw).
+    Self-gating: h -> 0 makes the allowance huge, so weakly-hidden gaussians are
+    untouched without any extra threshold.
+
+    term2 (§16 razor plates): relu(sg(ls2) - ln rp0 - ls3). Gradient reaches ls3
+    ONLY — the degenerate thin axis grows toward (mid axis / rp0); ls2 detached
+    for the same one-sidedness reason.
+
+    Means are over ELIGIBLE members (engaged or not), matching the r2 loss-site
+    convention. Returns dict(term1, term2, act1, act2, n1, n2): terms are scalar
+    tensors (a fresh graph-free 0.0 when the eligible set is empty); act*/n*
+    (active fractions / eligible counts) are filled only under with_stats=True —
+    they force GPU syncs, so the per-iteration loss site leaves them off.
+    """
+    device = scaling.device
+    zero = torch.zeros((), dtype=scaling.dtype, device=device)
+    out = dict(term1=zero, term2=zero, act1=0.0, act2=0.0, n1=0, n2=0)
+    rows = elig1 | elig2
+    if not bool(rows.any()):
+        return out
+    idx = torch.nonzero(rows, as_tuple=True)[0]
+    sl = torch.sort(scaling[idx], dim=1, descending=True).values
+    ls1, ls2, ls3 = sl[:, 0], sl[:, 1], sl[:, 2]
+    ls2_sg = ls2.detach()
+    e1 = elig1[idx]
+    if bool(e1.any()):
+        allow = log_r0 - torch.log(h[idx].detach() + eps)
+        p1 = torch.relu(ls1 - ls2_sg - allow)[e1]
+        out["term1"] = p1.mean()
+        if with_stats:
+            out["act1"] = float((p1 > 0).float().mean().item())
+            out["n1"] = int(e1.sum().item())
+    e2 = elig2[idx]
+    if bool(e2.any()):
+        p2 = torch.relu(ls2_sg - log_rp0 - ls3)[e2]
+        out["term2"] = p2.mean()
+        if with_stats:
+            out["act2"] = float((p2 > 0).float().mean().item())
+            out["n2"] = int(e2.sum().item())
+    return out
 
 
 def _class_weighted_counts(cam, gaussians, pipe, bg, args, dmap, groups):

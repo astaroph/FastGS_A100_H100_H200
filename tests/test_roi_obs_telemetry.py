@@ -613,7 +613,9 @@ def test_pool_cap_constants_are_pinned_in_source():
     src = inspect.getsource(fast_utils.observability_telemetry)
     assert re.search(r"^\s*K_LOCAL = 16\b", src, re.M)
     assert re.search(r"^\s*POOL_CAP = 60000\b", src, re.M)
-    assert "if pool_idx.numel() > K_LOCAL:" in src
+    # r4: the kNN pass is additionally gated by with_billboard (scale-reg v2
+    # refreshes skip it when the plate term is unarmed)
+    assert "if with_billboard and pool_idx.numel() > K_LOCAL:" in src
     assert "step = (pool_idx.numel() + POOL_CAP - 1) // POOL_CAP" in src
     assert "pool_idx = pool_idx[::step]" in src
     # normals are asked for with the same k the guard checks against
@@ -797,16 +799,27 @@ def _call_line_indices(lines):
 def test_train_py_telemetry_calls_are_flag_guarded_and_failsoft():
     lines = _train_lines()
     idxs = _call_line_indices(lines)
-    assert len(idxs) == 2, "expected exactly the heartbeat and the final dump"
+    assert len(idxs) == 4, ("expected heartbeat + final dump (telemetry) plus the two "
+                            "scale-reg-v2 observability refreshes (r4)")
+    obs_sites, v2_sites = [], []
     for i in idxs:
         headers = _enclosing_headers(lines, i)
-        assert "if roi_obs_telemetry:" in headers, lines[i]
-        # both call sites are read-only diagnostics: they must never kill a run
-        assert "try:" in headers, lines[i]
+        if "if roi_obs_telemetry:" in headers:
+            obs_sites.append(i)
+            # read-only diagnostics: they must never kill a run
+            assert "try:" in headers, lines[i]
+        else:
+            v2_sites.append(i)
+            # r4 refreshes feed a LOSS term: they sit behind the v2 gate only
+            # and must fail LOUD — a swallowed refresh failure would let
+            # training continue on a stale/absent observability cache.
+            assert "if scale_reg_v2_on:" in headers, lines[i]
+            assert "try:" not in headers, lines[i]
+    assert len(obs_sites) == 2 and len(v2_sites) == 2
     # every other mention is the from-import continuation line, not a call
     others = [i for i, ln in enumerate(lines)
               if "observability_telemetry" in ln and i not in idxs]
-    assert len(others) == 1 and "observability_telemetry)" in lines[others[0]]
+    assert len(others) == 1 and "observability_telemetry," in lines[others[0]]
 
 
 def test_train_py_heartbeat_cadence_and_off_path(monkeypatch):

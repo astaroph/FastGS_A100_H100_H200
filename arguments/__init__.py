@@ -85,6 +85,14 @@ class ModelParams(ParamGroup):
         # a final per-gaussian obs_telemetry.npz beside train_stats.json. Lives in
         # ModelParams because the camera load must keep the class maps when set.
         self.roi_obs_telemetry = False
+        # r4 scale regularization v2 (FASTGS_ROI_SCALE_REG_V2): "id:lambda" spec,
+        # LABEL-ONLY by design — exactly one entry whose id must equal
+        # roi_label_class_id (plan §11 correction #2: no union grouping). Uses the
+        # corrected observability modulation (preferential-hiddenness hinge +
+        # optional plate term; plan §11.5/§16/§17). "" = off. Mutually exclusive
+        # with --roi_scale_reg. Lives in ModelParams because the camera load must
+        # keep the per-camera class maps when it is set.
+        self.roi_scale_reg_v2 = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -162,6 +170,21 @@ class OptimizationParams(ParamGroup):
         # ray-modulated hinge fires only when (s1/s2) * |a1.r_bar| exceeds it.
         # Only read when --roi_scale_reg is set.
         self.roi_scale_reg_ratio = 4.0
+        # v2 allowance r0 (ratio): the preferential-hiddenness hinge fires when
+        # (s1/s2) * (h + eps) exceeds it (allowance ln r0 - ln(h+eps) is self-
+        # gating as h -> 0, so no separate h threshold exists for term 1).
+        # Frozen from the §17 npz calibration (12.9%/6.4% engagement sick/ctl).
+        # Only read when --roi_scale_reg_v2 is set.
+        self.roi_scale_reg_v2_ratio = 4.0
+        # v2 plate term (§16 razor plates): lambda for the one-sided thin-axis
+        # floor relu(sg(ls2) - ln plate_ratio - ls3), gated to billboard
+        # (|a3.n_local| < 0.5) & h > 0.3 gaussians. 0.0 = term off (default;
+        # ships as an explicit arm). Only read when --roi_scale_reg_v2 is set.
+        self.roi_scale_reg_v2_plate_lambda = 0.0
+        # v2 plate allowance (ratio s2/s3): the thin axis may be at most this
+        # much thinner than the mid axis before the plate term engages. §17
+        # frozen default (17.6%/4.3% gated engagement sick/ctl at 150).
+        self.roi_scale_reg_v2_plate_ratio = 150.0
         self.score_num_cameras = 10
         self.final_prune_interval = 3000
         self.final_prune_until_iter = 30000
