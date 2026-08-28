@@ -40,11 +40,30 @@ from utils.fast_utils import (compute_gaussian_score_fastgs, sampling_cameras,
                               scale_reg_v2_penalty)
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets, checkpoint_dir=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     roi_enabled = bool(getattr(dataset, "use_roi_masks", False))
+
+    # Preemption checkpoint saves (requeue-resume plan 2026-08-28): validate
+    # BEFORE any GPU-heavy work (same discipline as the ROI config checks below)
+    # — an unusable configuration must fail at startup, not at the first
+    # checkpoint iteration mid-training. Inert when no checkpoint iteration can
+    # fire (the default is now an empty list).
+    if checkpoint_iterations and any(0 < ci <= opt.iterations for ci in checkpoint_iterations):
+        if not (hasattr(gaussians, "capture") and hasattr(gaussians, "restore")):
+            raise RuntimeError(
+                "--checkpoint_iterations requested but this GaussianModel fork lacks "
+                "capture()/restore(); checkpoints could never be written or resumed.")
+        # restore() unconditionally unpacks the 14-tuple that capture() only
+        # produces for optimizer_type 'default' (incl. shoptimizer state); a
+        # sparse_adam checkpoint would be un-restorable, so refuse to write one.
+        if str(getattr(opt, "optimizer_type", "default")) != "default":
+            raise RuntimeError(
+                "--checkpoint_iterations requires optimizer_type 'default': restore() "
+                "unpacks the 14-element capture tuple (with shoptimizer state) and "
+                "would fail on the 13-element non-default capture.")
 
     # --- ROI config validation (BEFORE Scene: loadCam consumes roi_missing during
     # scene construction, and a typo'd enum must fail before any GPU-heavy work) --
@@ -263,7 +282,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians, roi_for_training=roi_enabled)
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        # weights_only=False: torch >= 2.6 flipped the default to True, which
+        # rejects the (capture(), iteration) tuple; explicit False restores the
+        # historical behavior on every torch version >= 1.13.
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
         if scale_reg_groups is not None:
             print("[ROI-SCALE-REG] WARNING: resuming from a checkpoint; the regularizer "
@@ -273,6 +295,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print("[ROI-SCALE-REG-V2] WARNING: resuming from a checkpoint; the regularizer "
                   "is inactive until the first densify/final-prune event after resume "
                   "re-derives the observability cache.")
+        if roi_prune_bg:
+            print("[ROI] WARNING: resuming from a checkpoint; roi_zero_rounds background-"
+                  "prune counters are not checkpointed and restart from zero — background "
+                  "pruning is delayed by up to roi_prune_min_rounds score events, never "
+                  "wrongly applied.")
 
     # --- ROI mask coverage check / banner (after Scene: needs loaded cameras) ---
     if roi_enabled:
@@ -824,6 +851,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "gaussian_count": int(gaussians.get_xyz.shape[0]),
                 })
 
+            # Preemption checkpoint save (restores the stock-3DGS block this fork
+            # dropped; requeue-resume plan 2026-08-28). Atomic tmp + os.replace so
+            # a mid-save preemption never leaves a truncated checkpoint (same
+            # pattern as the obs_telemetry npz dump); only the newest survives so
+            # the shared-FS footprint stays at one checkpoint per run.
+            if iteration in checkpoint_iterations:
+                ckpt_root = checkpoint_dir if checkpoint_dir else dataset.model_path
+                os.makedirs(ckpt_root, exist_ok=True)
+                ckpt_path = os.path.join(ckpt_root, "chkpnt{}.pth".format(iteration))
+                print("\n[ITER {}] Saving Checkpoint to {}".format(iteration, ckpt_path))
+                # This fork's capture() takes optimizer_type (stock 3DGS takes
+                # none); 'default' is enforced by the startup guard above so the
+                # tuple always matches what restore() unpacks.
+                torch.save((gaussians.capture(opt.optimizer_type), iteration), ckpt_path + ".tmp")
+                os.replace(ckpt_path + ".tmp", ckpt_path)
+                for fname in os.listdir(ckpt_root):
+                    if (fname.startswith("chkpnt") and fname.endswith(".pth")
+                            and fname != os.path.basename(ckpt_path)):
+                        try:
+                            older_iter = int(fname[len("chkpnt"):-len(".pth")])
+                        except ValueError:
+                            continue
+                        if older_iter < iteration:
+                            try:
+                                os.remove(os.path.join(ckpt_root, fname))
+                            except OSError:
+                                pass
+
     if opt.iterations in saving_iterations:
         # Re-save the terminal PLY: the in-loop save runs BEFORE the same
         # iteration's densify/late-prune blocks, so a run ending on a prune
@@ -1014,8 +1069,15 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[30_000])
+    # Default [] (stock-3DGS convention): before the save block was restored this
+    # default was dead code; [30_000] would now write a checkpoint at the final
+    # iteration of a bare default run, silently changing default behavior.
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    # Where checkpoints are written (default: the model dir). The pipeline passes
+    # a shared-FS dir here so a requeued job on a different node can resume;
+    # node-local model dirs die with the node.
+    parser.add_argument("--checkpoint_dir", type=str, default=None)
     parser.add_argument("--websockets", action='store_true', default=False)
     parser.add_argument("--benchmark_dir", type=str, default=None)
     args = parser.parse_args(sys.argv[1:])
@@ -1031,15 +1093,16 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
     training(
-        lp.extract(args), 
-        op.extract(args), 
-        pp.extract(args), 
-        args.test_iterations, 
-        args.save_iterations, 
-        args.checkpoint_iterations, 
-        args.start_checkpoint, 
-        args.debug_from, 
-        args.websockets
+        lp.extract(args),
+        op.extract(args),
+        pp.extract(args),
+        args.test_iterations,
+        args.save_iterations,
+        args.checkpoint_iterations,
+        args.start_checkpoint,
+        args.debug_from,
+        args.websockets,
+        checkpoint_dir=args.checkpoint_dir
     )
 
     # All done
